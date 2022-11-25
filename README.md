@@ -2,6 +2,8 @@
 
 This repo provide all the required config to generate stable diffusion images as found in this note: https://note.com/kohya_ss/n/n2693183a798e
 
+Take the time to read the note, lot's of valuable information. This code is more powerfull than it may seem.
+
 ## Required Dependencies
 
 Python 3.10.6 and Git:
