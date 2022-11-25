@@ -1,7 +1,6 @@
 # HOWTO
 
-This repo provide all the required config to run the Dreambooth version found in this note: https://note.com/kohya_ss/n/n2693183a798e
-
+This repo provide all the required config to generate stable diffusion images as found in this note: https://note.com/kohya_ss/n/n2693183a798e
 
 ## Required Dependencies
 
