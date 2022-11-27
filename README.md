@@ -56,21 +56,28 @@ python gen_img_diffusers_v1.py "<path to model>" --outdir "<path to output direc
 ### Options list
 
 ```powershell
-usage: gen_img_diffusers.py [-h] [--v2] [--prompt PROMPT] [--from_file FROM_FILE] [--interactive] [--image_path IMAGE_PATH] [--mask_path MASK_PATH] [--strength STRENGTH]
-                            [--images_per_prompt IMAGES_PER_PROMPT] [--outdir OUTDIR] [--sequential_file_name] [--n_iter N_ITER] [--H H] [--W W] [--batch_size BATCH_SIZE]
-                            [--steps STEPS] [--sampler {ddim,pndm,lms,euler,euler_a,dpmsolver,dpmsolver++,k_lms,k_euler,k_euler_a}] [--scale SCALE] [--ckpt CKPT] [--vae VAE]
-                            [--seed SEED] [--fp16] [--bf16] [--xformers] [--diffusers_xformers] [--opt_channels_last] [--hypernetwork_module HYPERNETWORK_MODULE]
-                            [--hypernetwork_weights HYPERNETWORK_WEIGHTS] [--hypernetwork_mul HYPERNETWORK_MUL] [--clip_skip CLIP_SKIP]
-                            [--max_embeddings_multiples MAX_EMBEDDINGS_MULTIPLES] [--clip_guidance_scale CLIP_GUIDANCE_SCALE] [--clip_image_guidance_scale CLIP_IMAGE_GUIDANCE_SCALE]   
-                            [--guide_image_path GUIDE_IMAGE_PATH] [--highres_fix_scale HIGHRES_FIX_SCALE] [--highres_fix_steps HIGHRES_FIX_STEPS] [--highres_fix_save_1st]
+usage: gen_img_diffusers.py [-h] [--v2] [--v_parameterization] [--prompt PROMPT] [--from_file FROM_FILE] [--interactive]
+                            [--no_preview] [--image_path IMAGE_PATH] [--mask_path MASK_PATH] [--strength STRENGTH]
+                            [--images_per_prompt IMAGES_PER_PROMPT] [--outdir OUTDIR] [--sequential_file_name] [--n_iter N_ITER]   
+                            [--H H] [--W W] [--batch_size BATCH_SIZE] [--steps STEPS]
+                            [--sampler {ddim,pndm,lms,euler,euler_a,dpmsolver,dpmsolver++,k_lms,k_euler,k_euler_a}]
+                            [--scale SCALE] [--ckpt CKPT] [--vae VAE] [--seed SEED] [--fp16] [--bf16] [--xformers]
+                            [--diffusers_xformers] [--opt_channels_last] [--hypernetwork_module HYPERNETWORK_MODULE]
+                            [--hypernetwork_weights HYPERNETWORK_WEIGHTS] [--hypernetwork_mul HYPERNETWORK_MUL]
+                            [--clip_skip CLIP_SKIP] [--max_embeddings_multiples MAX_EMBEDDINGS_MULTIPLES]
+                            [--clip_guidance_scale CLIP_GUIDANCE_SCALE] [--clip_image_guidance_scale CLIP_IMAGE_GUIDANCE_SCALE]    
+                            [--guide_image_path GUIDE_IMAGE_PATH] [--highres_fix_scale HIGHRES_FIX_SCALE]
+                            [--highres_fix_steps HIGHRES_FIX_STEPS] [--highres_fix_save_1st]
 
 options:
   -h, --help            show this help message and exit
   --v2                  load Stable Diffusion v2.0 model / Stable Diffusion 2.0のモデルを読み込む
+  --v_parameterization  enable v-parameterization training / v-parameterization学習を有効にする
   --prompt PROMPT       prompt / プロンプト
   --from_file FROM_FILE
                         if specified, load prompts from this file / 指定時はプロンプトをファイルから読み込む
   --interactive         interactive mode (generates one image) / 対話モード（生成される画像は1枚になります）
+  --no_preview          do not show generated image in interactive mode / 対話モードで画像を表示しない
   --image_path IMAGE_PATH
                         image to inpaint or to generate from / img2imgまたはinpaintを行う元画像
   --mask_path MASK_PATH
@@ -89,9 +96,10 @@ options:
   --steps STEPS         number of ddim sampling steps / サンプリングステップ数
   --sampler {ddim,pndm,lms,euler,euler_a,dpmsolver,dpmsolver++,k_lms,k_euler,k_euler_a}
                         sampler (scheduler) type / サンプラー（スケジューラ）の種類
-  --scale SCALE         unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty)) / guidance scale
+  --scale SCALE         unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty)) / guidance      
+                        scale
   --ckpt CKPT           path to checkpoint of model / モデルのcheckpointファイルまたはディレクトリ
-  --vae VAE             path to checkpoint of vae to replace / VAEを入れ替える場合、VAEのcheckpointファイルまたはディレクトリ
+  --vae VAE             path to checkpoint of vae to replace / VAEを入れ替える場合、VAEのcheckpointファイルまたはディレクトリ      
   --seed SEED           seed, or seed of seeds in multiple generation / 1枚生成時のseed、または複数枚生成時の乱数seedを決めるためのseed
   --fp16                use fp16 / fp16を指定し省メモリ化する
   --bf16                use bfloat16 / bfloat16を指定し省メモリ化する
@@ -109,13 +117,14 @@ options:
   --max_embeddings_multiples MAX_EMBEDDINGS_MULTIPLES
                         max embeding multiples, max token length is 75 * multiples / トークン長をデフォルトの何倍とするか 75*この値 がトークン長となる
   --clip_guidance_scale CLIP_GUIDANCE_SCALE
-                        enable CLIP guided SD, scale for guidance (DDIM, PNDM, LMS samplers only) / CLIP guided SDを有効にしてこのscaleを適用する（サンプラーはDDIM、PNDM、LMSのみ）    
+                        enable CLIP guided SD, scale for guidance (DDIM, PNDM, LMS samplers only) / CLIP guided
+                        SDを有効にしてこのscaleを適用する（サンプラーはDDIM、PNDM、LMSのみ）
   --clip_image_guidance_scale CLIP_IMAGE_GUIDANCE_SCALE
-                        enable CLIP guided SD by image, scale for guidance / 画像によるCLIP guided SDを有効にしてこのscaleを適用する
+                        enable CLIP guided SD by image, scale for guidance / 画像によるCLIP guided SDを有効にしてこのscaleを適用す る
   --guide_image_path GUIDE_IMAGE_PATH
                         image to CLIP guidance / CLIP guided SDでガイドに使う画像
   --highres_fix_scale HIGHRES_FIX_SCALE
-                        enable highres fix, reso scale for 1st stage / highres fixを有効にして最初の解像度をこのscaleにする
+                        enable highres fix, reso scale for 1st stage / highres fixを有効にして最初の解像度をこのscaleにする        
   --highres_fix_steps HIGHRES_FIX_STEPS
                         1st stage steps for highres fix / highres fixの最初のステージのステップ数
   --highres_fix_save_1st
