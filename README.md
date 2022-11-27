@@ -29,14 +29,7 @@ python -m venv --system-site-packages venv
 
 pip install torch==1.12.1+cu116 torchvision==0.13.1+cu116 --extra-index-url https://download.pytorch.org/whl/cu116
 
-pip install diffusers[torch]==0.7.2
-pip install transformers>=4.21.0
-pip install ftfy
-pip install opencv-python
-pip install einops
-pip install pytorch_lightning
-pip install open-clip-torch==2.7.0
-pip install tensorboard
+pip install -r requirements.txt
 
 pip install -U -I --no-deps https://github.com/C43H66N12O12S2/stable-diffusion-webui/releases/download/f/xformers-0.0.14.dev0-cp310-cp310-win_amd64.whl
 ```
@@ -132,4 +125,7 @@ options:
 ## Change history
 
 * 11/25 (v3.1): Initial commit. Include support for basic SD2.0
-* 11/28 (v4): v4: SD2.0 support (new U-Net/text encoder/tokenizer), simplify by DiffUsers 0.9.0, no_preview in interactive mode
+*11/27 (v4):
+- DiffUsers 0.9.0 is required. Upgrade as `pip install -U diffusers[torch]==0.9.0` in the virtual environment.
+- Added support for Stable Diffusion v2.0. Add the `--v2` option. If you are using `768-v-ema.ckpt` or `stable-diffusion-2` instead of `stable-diffusion-v2-base`, add `--v_parameterization` as well. Learn more about other options.
+- Added option to not display image in interactive mode --no_preview.
