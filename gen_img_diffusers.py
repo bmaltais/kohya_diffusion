@@ -1,6 +1,9 @@
 # txt2img with Diffusers: supports SD checkpoints, EulerScheduler, clip-skip, 225 tokens, Hypernetwork etc...
 
 # v2: CLIP guided Stable Diffusion, Image guided Stable Diffusion, highres. fix
+# v3: Add dpmsolver/dpmsolver++, add VAE loading, add upscale, add 'bf16', fix the issue hypernetwork_mul is not working
+# v4: SD2.0 support (new U-Net/text encoder/tokenizer), simplify by DiffUsers 0.9.0, no_preview in interactive mode
+
 
 # Copyright 2022 kohya_ss @kohya_ss
 #
@@ -25,28 +28,11 @@
 # ASL 2.0 https://github.com/huggingface/diffusers/blob/main/LICENSE
 
 
-import open_clip
-from diffusers.modeling_utils import ModelMixin
-from diffusers.models.unet_2d_condition import UNet2DConditionOutput
-from diffusers.models.unet_2d_blocks import (
-    CrossAttnDownBlock2D,
-    CrossAttnUpBlock2D,
-    DownBlock2D,
-    UNetMidBlock2DCrossAttn,
-    UpBlock2D,
-    # get_down_block,
-    # get_up_block,
-)
-from diffusers.models.embeddings import TimestepEmbedding, Timesteps
-import torch.nn as nn
-from diffusers.schedulers.scheduling_utils import SchedulerMixin, SchedulerOutput
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 import glob
 import importlib
 import inspect
 import time
-import cv2
 from diffusers.utils import deprecate
 from diffusers.configuration_utils import FrozenDict
 import argparse
@@ -59,22 +45,22 @@ from typing import Any, Callable, List, Optional, Union
 import diffusers
 import numpy as np
 import torch
-# DDIMScheduler,EulerDiscreteScheduler,
 from diffusers import (AutoencoderKL, DDPMScheduler,
-                       EulerAncestralDiscreteScheduler,
-                       LMSDiscreteScheduler, PNDMScheduler,
-                       UNet2DConditionModel)
+                       EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler,
+                       LMSDiscreteScheduler, PNDMScheduler, DDIMScheduler, EulerDiscreteScheduler,
+                       UNet2DConditionModel, StableDiffusionPipeline)
 from einops import rearrange
 from torch import einsum
 from tqdm import tqdm
 from torchvision import transforms
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel, CLIPTextConfig
 import PIL
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 # Tokenizer: checkpointから読み込むのではなくあらかじめ提供されているものを使う
 TOKENIZER_PATH = "openai/clip-vit-large-patch14"
+V2_STABLE_DIFFUSION_PATH = "stabilityai/stable-diffusion-2"     # ここからtokenizerだけ使う
 
 DEFAULT_TOKEN_LENGTH = 75
 
@@ -122,11 +108,11 @@ VAE_PARAMS_CH = 128
 VAE_PARAMS_CH_MULT = [1, 2, 4, 4]
 VAE_PARAMS_NUM_RES_BLOCKS = 2
 
-# Stable Diffusion 2.0
+# V2
+V2_UNET_PARAMS_ATTENTION_HEAD_DIM = [5, 10, 20, 20]
 V2_UNET_PARAMS_CONTEXT_DIM = 1024
-V2_UNET_PARAMS_NUM_HEAD_CHANNELS = 64
-V2_OPEN_CLIP_ARCH = "ViT-H-14"
-V2_OPEN_CLIP_VERSION = "laion2b_s32b_b79k"
+
+# region checkpoint変換、読み込み、書き込み ###############################
 
 # region StableDiffusion->Diffusersの変換コード
 # convert_original_stable_diffusion_to_diffusers をコピーしている（ASL 2.0）
@@ -295,7 +281,16 @@ def conv_attn_to_linear(checkpoint):
         checkpoint[key] = checkpoint[key][:, :, 0]
 
 
-def convert_ldm_unet_checkpoint(checkpoint, config):
+def linear_transformer_to_conv(checkpoint):
+  keys = list(checkpoint.keys())
+  tf_keys = ["proj_in.weight", "proj_out.weight"]
+  for key in keys:
+    if ".".join(key.split(".")[-2:]) in tf_keys:
+      if checkpoint[key].ndim == 2:
+        checkpoint[key] = checkpoint[key].unsqueeze(2).unsqueeze(2)
+
+
+def convert_ldm_unet_checkpoint(v2, checkpoint, config):
   """
   Takes a state dict and a config, and returns a converted checkpoint.
   """
@@ -445,6 +440,10 @@ def convert_ldm_unet_checkpoint(checkpoint, config):
 
         new_checkpoint[new_path] = unet_state_dict[old_path]
 
+  # SDのv2では1*1のconv2dがlinearに変わっているので、linear->convに変換する
+  if v2:
+    linear_transformer_to_conv(new_checkpoint)
+
   return new_checkpoint
 
 
@@ -555,7 +554,7 @@ def convert_ldm_vae_checkpoint(checkpoint, config):
   return new_checkpoint
 
 
-def create_unet_diffusers_config():
+def create_unet_diffusers_config(v2):
   """
   Creates a config for the diffusers based on the config of the LDM model.
   """
@@ -585,8 +584,8 @@ def create_unet_diffusers_config():
       up_block_types=tuple(up_block_types),
       block_out_channels=tuple(block_out_channels),
       layers_per_block=UNET_PARAMS_NUM_RES_BLOCKS,
-      cross_attention_dim=UNET_PARAMS_CONTEXT_DIM,
-      attention_head_dim=UNET_PARAMS_NUM_HEADS,
+      cross_attention_dim=UNET_PARAMS_CONTEXT_DIM if not v2 else V2_UNET_PARAMS_CONTEXT_DIM,
+      attention_head_dim=UNET_PARAMS_NUM_HEADS if not v2 else V2_UNET_PARAMS_ATTENTION_HEAD_DIM,
   )
 
   return config
@@ -615,27 +614,197 @@ def create_vae_diffusers_config():
   return config
 
 
-def convert_ldm_clip_checkpoint(checkpoint):
-  text_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
-
+def convert_ldm_clip_checkpoint_v1(checkpoint):
   keys = list(checkpoint.keys())
-
   text_model_dict = {}
-
   for key in keys:
     if key.startswith("cond_stage_model.transformer"):
       text_model_dict[key[len("cond_stage_model.transformer."):]] = checkpoint[key]
+  return text_model_dict
 
-  text_model.load_state_dict(text_model_dict)
 
-  return text_model
+def convert_ldm_clip_checkpoint_v2(checkpoint, max_length):
+  # 嫌になるくらい違うぞ！
+  def convert_key(key):
+    if not key.startswith("cond_stage_model"):
+      return None
+
+    # common conversion
+    key = key.replace("cond_stage_model.model.transformer.", "text_model.encoder.")
+    key = key.replace("cond_stage_model.model.", "text_model.")
+
+    if "resblocks" in key:
+      # resblocks conversion
+      key = key.replace(".resblocks.", ".layers.")
+      if ".ln_" in key:
+        key = key.replace(".ln_", ".layer_norm")
+      elif ".mlp." in key:
+        key = key.replace(".c_fc.", ".fc1.")
+        key = key.replace(".c_proj.", ".fc2.")
+      elif '.attn.out_proj' in key:
+        key = key.replace(".attn.out_proj.", ".self_attn.out_proj.")
+      elif '.attn.in_proj' in key:
+        key = None                  # 特殊なので後で処理する
+      else:
+        raise ValueError(f"unexpected key in SD: {key}")
+    elif '.positional_embedding' in key:
+      key = key.replace(".positional_embedding", ".embeddings.position_embedding.weight")
+    elif '.text_projection' in key:
+      key = None    # 使われない???
+    elif '.logit_scale' in key:
+      key = None    # 使われない???
+    elif '.token_embedding' in key:
+      key = key.replace(".token_embedding.weight", ".embeddings.token_embedding.weight")
+    elif '.ln_final' in key:
+      key = key.replace(".ln_final", ".final_layer_norm")
+    return key
+
+  keys = list(checkpoint.keys())
+  new_sd = {}
+  for key in keys:
+    # remove resblocks 23
+    if '.resblocks.23.' in key:
+      continue
+    new_key = convert_key(key)
+    if new_key is None:
+      continue
+    new_sd[new_key] = checkpoint[key]
+
+  # attnの変換
+  for key in keys:
+    if '.resblocks.23.' in key:
+      continue
+    if '.resblocks' in key and '.attn.in_proj_' in key:
+      # 三つに分割
+      values = torch.chunk(checkpoint[key], 3)
+
+      key_suffix = ".weight" if "weight" in key else ".bias"
+      key_pfx = key.replace("cond_stage_model.model.transformer.resblocks.", "text_model.encoder.layers.")
+      key_pfx = key_pfx.replace("_weight", "")
+      key_pfx = key_pfx.replace("_bias", "")
+      key_pfx = key_pfx.replace(".attn.in_proj", ".self_attn.")
+      new_sd[key_pfx + "q_proj" + key_suffix] = values[0]
+      new_sd[key_pfx + "k_proj" + key_suffix] = values[1]
+      new_sd[key_pfx + "v_proj" + key_suffix] = values[2]
+
+  # position_idsの追加
+  new_sd["text_model.embeddings.position_ids"] = torch.Tensor([list(range(max_length))]).to(torch.int64)
+  return new_sd
 
 # endregion
 
-# region モデル読み込み
+
+# region Diffusers->StableDiffusion の変換コード
+# convert_diffusers_to_original_stable_diffusion をコピーしている（ASL 2.0）
+
+def conv_transformer_to_linear(checkpoint):
+  keys = list(checkpoint.keys())
+  tf_keys = ["proj_in.weight", "proj_out.weight"]
+  for key in keys:
+    if ".".join(key.split(".")[-2:]) in tf_keys:
+      if checkpoint[key].ndim > 2:
+        checkpoint[key] = checkpoint[key][:, :, 0, 0]
 
 
-def load_checkpoint_with_conversion(ckpt_path):
+def convert_unet_state_dict_to_sd(v2, unet_state_dict):
+  unet_conversion_map = [
+      # (stable-diffusion, HF Diffusers)
+      ("time_embed.0.weight", "time_embedding.linear_1.weight"),
+      ("time_embed.0.bias", "time_embedding.linear_1.bias"),
+      ("time_embed.2.weight", "time_embedding.linear_2.weight"),
+      ("time_embed.2.bias", "time_embedding.linear_2.bias"),
+      ("input_blocks.0.0.weight", "conv_in.weight"),
+      ("input_blocks.0.0.bias", "conv_in.bias"),
+      ("out.0.weight", "conv_norm_out.weight"),
+      ("out.0.bias", "conv_norm_out.bias"),
+      ("out.2.weight", "conv_out.weight"),
+      ("out.2.bias", "conv_out.bias"),
+  ]
+
+  unet_conversion_map_resnet = [
+      # (stable-diffusion, HF Diffusers)
+      ("in_layers.0", "norm1"),
+      ("in_layers.2", "conv1"),
+      ("out_layers.0", "norm2"),
+      ("out_layers.3", "conv2"),
+      ("emb_layers.1", "time_emb_proj"),
+      ("skip_connection", "conv_shortcut"),
+  ]
+
+  unet_conversion_map_layer = []
+  for i in range(4):
+      # loop over downblocks/upblocks
+
+    for j in range(2):
+        # loop over resnets/attentions for downblocks
+      hf_down_res_prefix = f"down_blocks.{i}.resnets.{j}."
+      sd_down_res_prefix = f"input_blocks.{3*i + j + 1}.0."
+      unet_conversion_map_layer.append((sd_down_res_prefix, hf_down_res_prefix))
+
+      if i < 3:
+        # no attention layers in down_blocks.3
+        hf_down_atn_prefix = f"down_blocks.{i}.attentions.{j}."
+        sd_down_atn_prefix = f"input_blocks.{3*i + j + 1}.1."
+        unet_conversion_map_layer.append((sd_down_atn_prefix, hf_down_atn_prefix))
+
+    for j in range(3):
+      # loop over resnets/attentions for upblocks
+      hf_up_res_prefix = f"up_blocks.{i}.resnets.{j}."
+      sd_up_res_prefix = f"output_blocks.{3*i + j}.0."
+      unet_conversion_map_layer.append((sd_up_res_prefix, hf_up_res_prefix))
+
+      if i > 0:
+        # no attention layers in up_blocks.0
+        hf_up_atn_prefix = f"up_blocks.{i}.attentions.{j}."
+        sd_up_atn_prefix = f"output_blocks.{3*i + j}.1."
+        unet_conversion_map_layer.append((sd_up_atn_prefix, hf_up_atn_prefix))
+
+    if i < 3:
+      # no downsample in down_blocks.3
+      hf_downsample_prefix = f"down_blocks.{i}.downsamplers.0.conv."
+      sd_downsample_prefix = f"input_blocks.{3*(i+1)}.0.op."
+      unet_conversion_map_layer.append((sd_downsample_prefix, hf_downsample_prefix))
+
+      # no upsample in up_blocks.3
+      hf_upsample_prefix = f"up_blocks.{i}.upsamplers.0."
+      sd_upsample_prefix = f"output_blocks.{3*i + 2}.{1 if i == 0 else 2}."
+      unet_conversion_map_layer.append((sd_upsample_prefix, hf_upsample_prefix))
+
+  hf_mid_atn_prefix = "mid_block.attentions.0."
+  sd_mid_atn_prefix = "middle_block.1."
+  unet_conversion_map_layer.append((sd_mid_atn_prefix, hf_mid_atn_prefix))
+
+  for j in range(2):
+    hf_mid_res_prefix = f"mid_block.resnets.{j}."
+    sd_mid_res_prefix = f"middle_block.{2*j}."
+    unet_conversion_map_layer.append((sd_mid_res_prefix, hf_mid_res_prefix))
+
+  # buyer beware: this is a *brittle* function,
+  # and correct output requires that all of these pieces interact in
+  # the exact order in which I have arranged them.
+  mapping = {k: k for k in unet_state_dict.keys()}
+  for sd_name, hf_name in unet_conversion_map:
+    mapping[hf_name] = sd_name
+  for k, v in mapping.items():
+    if "resnets" in k:
+      for sd_part, hf_part in unet_conversion_map_resnet:
+        v = v.replace(hf_part, sd_part)
+      mapping[k] = v
+  for k, v in mapping.items():
+    for sd_part, hf_part in unet_conversion_map_layer:
+      v = v.replace(hf_part, sd_part)
+    mapping[k] = v
+  new_state_dict = {v: unet_state_dict[k] for k, v in mapping.items()}
+
+  if v2:
+    conv_transformer_to_linear(new_state_dict)
+
+  return new_state_dict
+
+# endregion
+
+
+def load_checkpoint_with_text_encoder_conversion(ckpt_path):
   # text encoderの格納形式が違うモデルに対応する ('text_model'がない)
   TEXT_ENCODER_KEY_REPLACEMENTS = [
       ('cond_stage_model.transformer.embeddings.', 'cond_stage_model.transformer.text_model.embeddings.'),
@@ -660,8 +829,8 @@ def load_checkpoint_with_conversion(ckpt_path):
   return checkpoint
 
 
-def load_models_from_stable_diffusion_checkpoint(ckpt_path, dtype=None):
-  checkpoint = load_checkpoint_with_conversion(ckpt_path)
+def load_models_from_stable_diffusion_checkpoint(v2, ckpt_path, dtype=None):
+  checkpoint = load_checkpoint_with_text_encoder_conversion(ckpt_path)
   state_dict = checkpoint["state_dict"]
   if dtype is not None:
     for k, v in state_dict.items():
@@ -669,764 +838,12 @@ def load_models_from_stable_diffusion_checkpoint(ckpt_path, dtype=None):
         state_dict[k] = v.to(dtype)
 
   # Convert the UNet2DConditionModel model.
-  unet_config = create_unet_diffusers_config()
-  converted_unet_checkpoint = convert_ldm_unet_checkpoint(state_dict, unet_config)
+  unet_config = create_unet_diffusers_config(v2)
+  converted_unet_checkpoint = convert_ldm_unet_checkpoint(v2, state_dict, unet_config)
 
   unet = UNet2DConditionModel(**unet_config)
-  unet.load_state_dict(converted_unet_checkpoint)
-
-  # Convert the VAE model.
-  vae_config = create_vae_diffusers_config()
-  converted_vae_checkpoint = convert_ldm_vae_checkpoint(state_dict, vae_config)
-
-  vae = AutoencoderKL(**vae_config)
-  vae.load_state_dict(converted_vae_checkpoint)
-
-  # convert text_model
-  text_model = convert_ldm_clip_checkpoint(state_dict)
-
-  return text_model, vae, unet
-
-# endregion
-
-# region Stable Diffusion v2
-
-
-def get_down_block(
-    down_block_type,
-    num_layers,
-    in_channels,
-    out_channels,
-    temb_channels,
-    add_downsample,
-    resnet_eps,
-    resnet_act_fn,
-    num_heads,  # attn_num_head_channels,  # 変数名が間違ってるので注意。ここに入るのはヘッド数
-    resnet_groups=None,
-    cross_attention_dim=None,
-    downsample_padding=None,
-    num_head_channels=None,
-):
-  down_block_type = down_block_type[7:] if down_block_type.startswith("UNetRes") else down_block_type
-  if down_block_type == "DownBlock2D":
-    return DownBlock2D(
-        num_layers=num_layers,
-        in_channels=in_channels,
-        out_channels=out_channels,
-        temb_channels=temb_channels,
-        add_downsample=add_downsample,
-        resnet_eps=resnet_eps,
-        resnet_act_fn=resnet_act_fn,
-        resnet_groups=resnet_groups,
-        downsample_padding=downsample_padding,
-    )
-  # elif down_block_type == "AttnDownBlock2D":
-  #   return AttnDownBlock2D(
-  #       num_layers=num_layers,
-  #       in_channels=in_channels,
-  #       out_channels=out_channels,
-  #       temb_channels=temb_channels,
-  #       add_downsample=add_downsample,
-  #       resnet_eps=resnet_eps,
-  #       resnet_act_fn=resnet_act_fn,
-  #       resnet_groups=resnet_groups,
-  #       downsample_padding=downsample_padding,
-  #       attn_num_head_channels=num_heads,  # attn_num_head_channels,
-  #   )
-  elif down_block_type == "CrossAttnDownBlock2D":
-    if cross_attention_dim is None:
-      raise ValueError("cross_attention_dim must be specified for CrossAttnDownBlock2D")
-    if num_heads == -1:
-      num_heads = out_channels // num_head_channels
-    print("num heads calculated:", num_heads, out_channels, num_head_channels)
-
-    return CrossAttnDownBlock2D(
-        num_layers=num_layers,
-        in_channels=in_channels,
-        out_channels=out_channels,
-        temb_channels=temb_channels,
-        add_downsample=add_downsample,
-        resnet_eps=resnet_eps,
-        resnet_act_fn=resnet_act_fn,
-        resnet_groups=resnet_groups,
-        downsample_padding=downsample_padding,
-        cross_attention_dim=cross_attention_dim,
-        attn_num_head_channels=num_heads,  # attn_num_head_channels,    # num_heads
-    )
-  # elif down_block_type == "SkipDownBlock2D":
-  #   return SkipDownBlock2D(
-  #       num_layers=num_layers,
-  #       in_channels=in_channels,
-  #       out_channels=out_channels,
-  #       temb_channels=temb_channels,
-  #       add_downsample=add_downsample,
-  #       resnet_eps=resnet_eps,
-  #       resnet_act_fn=resnet_act_fn,
-  #       downsample_padding=downsample_padding,
-  #   )
-  # elif down_block_type == "AttnSkipDownBlock2D":
-  #   return AttnSkipDownBlock2D(
-  #       num_layers=num_layers,
-  #       in_channels=in_channels,
-  #       out_channels=out_channels,
-  #       temb_channels=temb_channels,
-  #       add_downsample=add_downsample,
-  #       resnet_eps=resnet_eps,
-  #       resnet_act_fn=resnet_act_fn,
-  #       downsample_padding=downsample_padding,
-  #       attn_num_head_channels=attn_num_head_channels,
-  #   )
-  # elif down_block_type == "DownEncoderBlock2D":
-  #   return DownEncoderBlock2D(
-  #       num_layers=num_layers,
-  #       in_channels=in_channels,
-  #       out_channels=out_channels,
-  #       add_downsample=add_downsample,
-  #       resnet_eps=resnet_eps,
-  #       resnet_act_fn=resnet_act_fn,
-  #       resnet_groups=resnet_groups,
-  #       downsample_padding=downsample_padding,
-  #   )
-  # elif down_block_type == "AttnDownEncoderBlock2D":
-  #   return AttnDownEncoderBlock2D(
-  #       num_layers=num_layers,
-  #       in_channels=in_channels,
-  #       out_channels=out_channels,
-  #       add_downsample=add_downsample,
-  #       resnet_eps=resnet_eps,
-  #       resnet_act_fn=resnet_act_fn,
-  #       resnet_groups=resnet_groups,
-  #       downsample_padding=downsample_padding,
-  #       attn_num_head_channels=attn_num_head_channels,
-  #   )
-  raise ValueError(f"{down_block_type} does not exist.")
-
-
-def get_up_block(
-    up_block_type,
-    num_layers,
-    in_channels,
-    out_channels,
-    prev_output_channel,
-    temb_channels,
-    add_upsample,
-    resnet_eps,
-    resnet_act_fn,
-    num_heads,  # attn_num_head_channels,  # 変数名が間違ってるので注意。ここに入るのはヘッド数
-    resnet_groups=None,
-    cross_attention_dim=None,
-    num_head_channels=None,
-):
-  up_block_type = up_block_type[7:] if up_block_type.startswith("UNetRes") else up_block_type
-  if up_block_type == "UpBlock2D":
-    return UpBlock2D(
-        num_layers=num_layers,
-        in_channels=in_channels,
-        out_channels=out_channels,
-        prev_output_channel=prev_output_channel,
-        temb_channels=temb_channels,
-        add_upsample=add_upsample,
-        resnet_eps=resnet_eps,
-        resnet_act_fn=resnet_act_fn,
-        resnet_groups=resnet_groups,
-    )
-  elif up_block_type == "CrossAttnUpBlock2D":
-    if cross_attention_dim is None:
-      raise ValueError("cross_attention_dim must be specified for CrossAttnUpBlock2D")
-    if num_heads == -1:
-      num_heads = out_channels // num_head_channels
-    print("num heads calculated:", num_heads, out_channels, num_head_channels)
-
-    return CrossAttnUpBlock2D(
-        num_layers=num_layers,
-        in_channels=in_channels,
-        out_channels=out_channels,
-        prev_output_channel=prev_output_channel,
-        temb_channels=temb_channels,
-        add_upsample=add_upsample,
-        resnet_eps=resnet_eps,
-        resnet_act_fn=resnet_act_fn,
-        resnet_groups=resnet_groups,
-        cross_attention_dim=cross_attention_dim,
-        attn_num_head_channels=num_heads,  # attn_num_head_channels,
-    )
-  # elif up_block_type == "AttnUpBlock2D":
-  #   return AttnUpBlock2D(
-  #       num_layers=num_layers,
-  #       in_channels=in_channels,
-  #       out_channels=out_channels,
-  #       prev_output_channel=prev_output_channel,
-  #       temb_channels=temb_channels,
-  #       add_upsample=add_upsample,
-  #       resnet_eps=resnet_eps,
-  #       resnet_act_fn=resnet_act_fn,
-  #       resnet_groups=resnet_groups,
-  #       attn_num_head_channels=attn_num_head_channels,
-  #   )
-  # elif up_block_type == "SkipUpBlock2D":
-  #   return SkipUpBlock2D(
-  #       num_layers=num_layers,
-  #       in_channels=in_channels,
-  #       out_channels=out_channels,
-  #       prev_output_channel=prev_output_channel,
-  #       temb_channels=temb_channels,
-  #       add_upsample=add_upsample,
-  #       resnet_eps=resnet_eps,
-  #       resnet_act_fn=resnet_act_fn,
-  #   )
-  # elif up_block_type == "AttnSkipUpBlock2D":
-  #   return AttnSkipUpBlock2D(
-  #       num_layers=num_layers,
-  #       in_channels=in_channels,
-  #       out_channels=out_channels,
-  #       prev_output_channel=prev_output_channel,
-  #       temb_channels=temb_channels,
-  #       add_upsample=add_upsample,
-  #       resnet_eps=resnet_eps,
-  #       resnet_act_fn=resnet_act_fn,
-  #       attn_num_head_channels=attn_num_head_channels,
-  #   )
-  # elif up_block_type == "UpDecoderBlock2D":
-  #   return UpDecoderBlock2D(
-  #       num_layers=num_layers,
-  #       in_channels=in_channels,
-  #       out_channels=out_channels,
-  #       add_upsample=add_upsample,
-  #       resnet_eps=resnet_eps,
-  #       resnet_act_fn=resnet_act_fn,
-  #       resnet_groups=resnet_groups,
-  #   )
-  # elif up_block_type == "AttnUpDecoderBlock2D":
-  #   return AttnUpDecoderBlock2D(
-  #       num_layers=num_layers,
-  #       in_channels=in_channels,
-  #       out_channels=out_channels,
-  #       add_upsample=add_upsample,
-  #       resnet_eps=resnet_eps,
-  #       resnet_act_fn=resnet_act_fn,
-  #       resnet_groups=resnet_groups,
-  #       attn_num_head_channels=attn_num_head_channels,
-  #   )
-  raise ValueError(f"{up_block_type} does not exist.")
-
-
-class UNet2DConditionModelV2(ModelMixin, ConfigMixin):
-  r"""
-  UNet2DConditionModel is a conditional 2D UNet model that takes in a noisy sample, conditional state, and a timestep
-  and returns sample shaped output.
-
-  This model inherits from [`ModelMixin`]. Check the superclass documentation for the generic methods the library
-  implements for all the models (such as downloading or saving, etc.)
-
-  Parameters:
-      sample_size (`int`, *optional*): The size of the input sample.
-      in_channels (`int`, *optional*, defaults to 4): The number of channels in the input sample.
-      out_channels (`int`, *optional*, defaults to 4): The number of channels in the output.
-      center_input_sample (`bool`, *optional*, defaults to `False`): Whether to center the input sample.
-      flip_sin_to_cos (`bool`, *optional*, defaults to `False`):
-          Whether to flip the sin to cos in the time embedding.
-      freq_shift (`int`, *optional*, defaults to 0): The frequency shift to apply to the time embedding.
-      down_block_types (`Tuple[str]`, *optional*, defaults to `("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D")`):
-          The tuple of downsample blocks to use.
-      up_block_types (`Tuple[str]`, *optional*, defaults to `("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D",)`):
-          The tuple of upsample blocks to use.
-      block_out_channels (`Tuple[int]`, *optional*, defaults to `(320, 640, 1280, 1280)`):
-          The tuple of output channels for each block.
-      layers_per_block (`int`, *optional*, defaults to 2): The number of layers per block.
-      downsample_padding (`int`, *optional*, defaults to 1): The padding to use for the downsampling convolution.
-      mid_block_scale_factor (`float`, *optional*, defaults to 1.0): The scale factor to use for the mid block.
-      act_fn (`str`, *optional*, defaults to `"silu"`): The activation function to use.
-      norm_num_groups (`int`, *optional*, defaults to 32): The number of groups to use for the normalization.
-      norm_eps (`float`, *optional*, defaults to 1e-5): The epsilon to use for the normalization.
-      cross_attention_dim (`int`, *optional*, defaults to 1280): The dimension of the cross attention features.
-      attention_head_dim (`int`, *optional*, defaults to 8): The dimension of the attention heads.
-  """
-
-  _supports_gradient_checkpointing = True
-
-  @register_to_config
-  def __init__(
-      self,
-      sample_size: Optional[int] = None,
-      in_channels: int = 4,
-      out_channels: int = 4,
-      center_input_sample: bool = False,
-      flip_sin_to_cos: bool = True,
-      freq_shift: int = 0,
-      down_block_types: Tuple[str] = (
-          "CrossAttnDownBlock2D",
-          "CrossAttnDownBlock2D",
-          "CrossAttnDownBlock2D",
-          "DownBlock2D",
-      ),
-      up_block_types: Tuple[str] = ("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
-      block_out_channels: Tuple[int] = (320, 640, 1280, 1280),
-      layers_per_block: int = 2,
-      downsample_padding: int = 1,
-      mid_block_scale_factor: float = 1,
-      act_fn: str = "silu",
-      norm_num_groups: int = 32,
-      norm_eps: float = 1e-5,
-      cross_attention_dim: int = 1280,
-      attention_head_dim: int = -1,  # 8,
-      num_head_channels: int = 320,  # 1280/8
-  ):
-    super().__init__()
-
-    self.sample_size = sample_size
-    time_embed_dim = block_out_channels[0] * 4
-
-    # input
-    self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=(1, 1))
-
-    # time
-    self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
-    timestep_input_dim = block_out_channels[0]
-
-    self.time_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim)
-
-    self.down_blocks = nn.ModuleList([])
-    self.mid_block = None
-    self.up_blocks = nn.ModuleList([])
-
-    # down
-    output_channel = block_out_channels[0]
-    for i, down_block_type in enumerate(down_block_types):
-      input_channel = output_channel
-      output_channel = block_out_channels[i]
-      is_final_block = i == len(block_out_channels) - 1
-
-      down_block = get_down_block(
-          down_block_type,
-          num_layers=layers_per_block,
-          in_channels=input_channel,
-          out_channels=output_channel,
-          temb_channels=time_embed_dim,
-          add_downsample=not is_final_block,
-          resnet_eps=norm_eps,
-          resnet_act_fn=act_fn,
-          resnet_groups=norm_num_groups,
-          cross_attention_dim=cross_attention_dim,
-          num_heads=attention_head_dim,  # attn_num_head_channels=attention_head_dim,
-          downsample_padding=downsample_padding,
-          num_head_channels=num_head_channels,
-      )
-      self.down_blocks.append(down_block)
-
-    # mid
-    num_heads = attention_head_dim                  # 変数名がおかしい
-    if attention_head_dim == -1:
-      num_heads = block_out_channels[-1] // num_head_channels
-    print("num heads calculated:", num_heads, block_out_channels[-1], num_head_channels)
-
-    self.mid_block = UNetMidBlock2DCrossAttn(
-        in_channels=block_out_channels[-1],
-        temb_channels=time_embed_dim,
-        resnet_eps=norm_eps,
-        resnet_act_fn=act_fn,
-        output_scale_factor=mid_block_scale_factor,
-        resnet_time_scale_shift="default",
-        cross_attention_dim=cross_attention_dim,
-        attn_num_head_channels=num_heads,  # attention_head_dim,
-        resnet_groups=norm_num_groups,
-    )
-
-    # count how many layers upsample the images
-    self.num_upsamplers = 0
-
-    # up
-    reversed_block_out_channels = list(reversed(block_out_channels))
-    output_channel = reversed_block_out_channels[0]
-    for i, up_block_type in enumerate(up_block_types):
-      is_final_block = i == len(block_out_channels) - 1
-
-      prev_output_channel = output_channel
-      output_channel = reversed_block_out_channels[i]
-      input_channel = reversed_block_out_channels[min(i + 1, len(block_out_channels) - 1)]
-
-      # add upsample block for all BUT final layer
-      if not is_final_block:
-        add_upsample = True
-        self.num_upsamplers += 1
-      else:
-        add_upsample = False
-
-      up_block = get_up_block(
-          up_block_type,
-          num_layers=layers_per_block + 1,
-          in_channels=input_channel,
-          out_channels=output_channel,
-          prev_output_channel=prev_output_channel,
-          temb_channels=time_embed_dim,
-          add_upsample=add_upsample,
-          resnet_eps=norm_eps,
-          resnet_act_fn=act_fn,
-          resnet_groups=norm_num_groups,
-          cross_attention_dim=cross_attention_dim,
-          num_heads=attention_head_dim,  # attn_num_head_channels=attention_head_dim,
-          num_head_channels=num_head_channels,
-      )
-      self.up_blocks.append(up_block)
-      prev_output_channel = output_channel
-
-    # out
-    self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps)
-    self.conv_act = nn.SiLU()
-    self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, 3, padding=1)
-
-  def set_attention_slice(self, slice_size):
-    if slice_size is not None and self.config.attention_head_dim % slice_size != 0:
-      raise ValueError(
-          f"Make sure slice_size {slice_size} is a divisor of "
-          f"the number of heads used in cross_attention {self.config.attention_head_dim}"
-      )
-    if slice_size is not None and slice_size > self.config.attention_head_dim:
-      raise ValueError(
-          f"Chunk_size {slice_size} has to be smaller or equal to "
-          f"the number of heads used in cross_attention {self.config.attention_head_dim}"
-      )
-
-    for block in self.down_blocks:
-      if hasattr(block, "attentions") and block.attentions is not None:
-        block.set_attention_slice(slice_size)
-
-    self.mid_block.set_attention_slice(slice_size)
-
-    for block in self.up_blocks:
-      if hasattr(block, "attentions") and block.attentions is not None:
-        block.set_attention_slice(slice_size)
-
-  def set_use_memory_efficient_attention_xformers(self, use_memory_efficient_attention_xformers: bool):
-    for block in self.down_blocks:
-      if hasattr(block, "attentions") and block.attentions is not None:
-        block.set_use_memory_efficient_attention_xformers(use_memory_efficient_attention_xformers)
-
-    self.mid_block.set_use_memory_efficient_attention_xformers(use_memory_efficient_attention_xformers)
-
-    for block in self.up_blocks:
-      if hasattr(block, "attentions") and block.attentions is not None:
-        block.set_use_memory_efficient_attention_xformers(use_memory_efficient_attention_xformers)
-
-  def _set_gradient_checkpointing(self, module, value=False):
-    if isinstance(module, (CrossAttnDownBlock2D, DownBlock2D, CrossAttnUpBlock2D, UpBlock2D)):
-      module.gradient_checkpointing = value
-
-  def forward(
-      self,
-      sample: torch.FloatTensor,
-      timestep: Union[torch.Tensor, float, int],
-      encoder_hidden_states: torch.Tensor,
-      return_dict: bool = True,
-  ) -> Union[UNet2DConditionOutput, Tuple]:
-    r"""
-    Args:
-        sample (`torch.FloatTensor`): (batch, channel, height, width) noisy inputs tensor
-        timestep (`torch.FloatTensor` or `float` or `int`): (batch) timesteps
-        encoder_hidden_states (`torch.FloatTensor`): (batch, channel, height, width) encoder hidden states
-        return_dict (`bool`, *optional*, defaults to `True`):
-            Whether or not to return a [`models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain tuple.
-
-    Returns:
-        [`~models.unet_2d_condition.UNet2DConditionOutput`] or `tuple`:
-        [`~models.unet_2d_condition.UNet2DConditionOutput`] if `return_dict` is True, otherwise a `tuple`. When
-        returning a tuple, the first element is the sample tensor.
-    """
-    # By default samples have to be AT least a multiple of the overall upsampling factor.
-    # The overall upsampling factor is equal to 2 ** (# num of upsampling layears).
-    # However, the upsampling interpolation output size can be forced to fit any upsampling size
-    # on the fly if necessary.
-    default_overall_up_factor = 2**self.num_upsamplers
-
-    # upsample size should be forwarded when sample is not a multiple of `default_overall_up_factor`
-    forward_upsample_size = False
-    upsample_size = None
-
-    if any(s % default_overall_up_factor != 0 for s in sample.shape[-2:]):
-      # logger.info("Forward upsample size to force interpolation output size.")
-      print("Forward upsample size to force interpolation output size.")
-      forward_upsample_size = True
-
-    # 0. center input if necessary
-    if self.config.center_input_sample:
-      sample = 2 * sample - 1.0
-
-    # 1. time
-    timesteps = timestep
-    if not torch.is_tensor(timesteps):
-      # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-      timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
-    elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-      timesteps = timesteps[None].to(sample.device)
-
-    # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-    timesteps = timesteps.expand(sample.shape[0])
-
-    t_emb = self.time_proj(timesteps)
-
-    # timesteps does not contain any weights and will always return f32 tensors
-    # but time_embedding might actually be running in fp16. so we need to cast here.
-    # there might be better ways to encapsulate this.
-    t_emb = t_emb.to(dtype=self.dtype)
-    emb = self.time_embedding(t_emb)
-
-    # 2. pre-process
-    sample = self.conv_in(sample)
-
-    # 3. down
-    down_block_res_samples = (sample,)
-    for downsample_block in self.down_blocks:
-      if hasattr(downsample_block, "attentions") and downsample_block.attentions is not None:
-        sample, res_samples = downsample_block(
-            hidden_states=sample,
-            temb=emb,
-            encoder_hidden_states=encoder_hidden_states,
-        )
-      else:
-        sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
-
-      down_block_res_samples += res_samples
-
-    # 4. mid
-    sample = self.mid_block(sample, emb, encoder_hidden_states=encoder_hidden_states)
-
-    # 5. up
-    for i, upsample_block in enumerate(self.up_blocks):
-      is_final_block = i == len(self.up_blocks) - 1
-
-      res_samples = down_block_res_samples[-len(upsample_block.resnets):]
-      down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
-
-      # if we have not reached the final block and need to forward the
-      # upsample size, we do it here
-      if not is_final_block and forward_upsample_size:
-        upsample_size = down_block_res_samples[-1].shape[2:]
-
-      if hasattr(upsample_block, "attentions") and upsample_block.attentions is not None:
-        sample = upsample_block(
-            hidden_states=sample,
-            temb=emb,
-            res_hidden_states_tuple=res_samples,
-            encoder_hidden_states=encoder_hidden_states,
-            upsample_size=upsample_size,
-        )
-      else:
-        sample = upsample_block(
-            hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples, upsample_size=upsample_size
-        )
-    # 6. post-process
-    sample = self.conv_norm_out(sample)
-    sample = self.conv_act(sample)
-    sample = self.conv_out(sample)
-
-    if not return_dict:
-      return (sample,)
-
-    return UNet2DConditionOutput(sample=sample)
-
-
-def create_unet_diffusers_config_v2():
-  """
-  Creates a config for the diffusers based on the config of the LDM model.
-  """
-  # unet_params = original_config.model.params.unet_config.params
-
-  block_out_channels = [UNET_PARAMS_MODEL_CHANNELS * mult for mult in UNET_PARAMS_CHANNEL_MULT]
-
-  down_block_types = []
-  resolution = 1
-  for i in range(len(block_out_channels)):
-    block_type = "CrossAttnDownBlock2D" if resolution in UNET_PARAMS_ATTENTION_RESOLUTIONS else "DownBlock2D"
-    down_block_types.append(block_type)
-    if i != len(block_out_channels) - 1:
-      resolution *= 2
-
-  up_block_types = []
-  for i in range(len(block_out_channels)):
-    block_type = "CrossAttnUpBlock2D" if resolution in UNET_PARAMS_ATTENTION_RESOLUTIONS else "UpBlock2D"
-    up_block_types.append(block_type)
-    resolution //= 2
-
-  config = dict(
-      sample_size=UNET_PARAMS_IMAGE_SIZE,
-      in_channels=UNET_PARAMS_IN_CHANNELS,
-      out_channels=UNET_PARAMS_OUT_CHANNELS,
-      down_block_types=tuple(down_block_types),
-      up_block_types=tuple(up_block_types),
-      block_out_channels=tuple(block_out_channels),
-      layers_per_block=UNET_PARAMS_NUM_RES_BLOCKS,
-      cross_attention_dim=V2_UNET_PARAMS_CONTEXT_DIM,
-      attention_head_dim=-1,  # UNET_PARAMS_NUM_HEADS,
-      num_head_channels=V2_UNET_PARAMS_NUM_HEAD_CHANNELS,
-  )
-
-  return config
-
-
-class TokenizerWrapperResult():
-  def __init__(self, tokens) -> None:
-    self.input_ids = tokens
-
-# open_clipのTokenizerを今までのtokenizerと同じように使うためのwrapper:
-# zero_paddingをEOS paddingに置き換える
-# __call__の仕様を合わせる
-class TokenizerWrapper():
-  BOS = 49406
-  EOS = 49407
-  bos_token_id = BOS
-  eos_token_id = EOS
-
-  def __init__(self, model_max_length) -> None:
-    self.model_max_length = model_max_length
-
-  def __call__(self, text, padding=None, max_length=None, truncation=None, return_tensors=None) -> Any:
-    # サポート外の引数はエラーになる
-    if max_length is None:
-      max_length = self.model_max_length
-    if truncation is None:
-      assert padding is None, f"padding must be None when truncation is None"
-      max_length = 2000      # ありえないぐらい長い文字数
-
-    tokens = open_clip.tokenize(text, max_length)[0]        # リストに対応しているがとりあえず1件だけ
-
-    zero_pos = (tokens == 0).nonzero(as_tuple=True)[0]
-    assert len(zero_pos) == max_length - zero_pos[0], f"illegal tokens, token after zero: {tokens}"
-    zero_pos = zero_pos[0]
-    zero_pos = int(zero_pos)
-    assert tokens[zero_pos - 1] == TokenizerWrapper.EOS, f"illegal tokens, no EOS before zero: {tokens}"
-
-    if padding is None:
-      # zero paddingを消す
-      tokens = tokens[:zero_pos]
-    else:
-      # EOSのあとのzero paddingをEOSにする
-      tokens[zero_pos:] = TokenizerWrapper.EOS
-
-    if return_tensors is None:
-      tokens = tokens.tolist()
-
-    return TokenizerWrapperResult(tokens)
-
-  @staticmethod
-  def unwrap(tokens):
-    # EOSのあとをzeroで埋める
-    for i in range(len(tokens)):
-      eos_pos = (tokens[i] == TokenizerWrapper.EOS).nonzero(as_tuple=True)[0][0]
-      tokens[i, eos_pos + 1:] = 0
-    return tokens
-
-
-class FrozenOpenCLIPEmbedder(nn.Module):  # AbstractEncoder):
-  """
-  Uses the OpenCLIP transformer encoder for text
-  """
-  LAYERS = [
-      # "pooled",
-      "last",
-      "penultimate"
-  ]
-
-  def __init__(self, arch="ViT-H-14", version="laion2b_s32b_b79k", device="cuda", max_length=77,
-               freeze=True, layer="last"):
-    super().__init__()
-    assert layer in self.LAYERS
-    model, _, _ = open_clip.create_model_and_transforms(arch, device=torch.device('cpu'), pretrained=version)
-    del model.visual
-    self.model = model
-
-    self.device = device
-    self.max_length = max_length
-    if freeze:
-      self.freeze()
-    self.layer = layer
-    if self.layer == "last":
-      self.layer_idx = 0
-    elif self.layer == "penultimate":
-      self.layer_idx = 1
-    else:
-      raise NotImplementedError()
-
-    self.tokenizer_wrapper = TokenizerWrapper(max_length)
-
-  def freeze(self):
-    self.model = self.model.eval()
-    for param in self.parameters():
-      param.requires_grad = False
-
-  def forward(self, tokens):
-    # tokens = open_clip.tokenize(text)
-    tokens = TokenizerWrapper.unwrap(tokens)
-    z = self.encode_with_transformer(tokens.to(self.device))
-    return (z, )                  # SD1.4のtext_encoderとの互換性を持たせるためにtupleで返す
-
-  def encode_with_transformer(self, text):
-    x = self.model.token_embedding(text)  # [batch_size, n_ctx, d_model]
-    x = x + self.model.positional_embedding
-    x = x.permute(1, 0, 2)  # NLD -> LND
-    x = self.text_transformer_forward(x, attn_mask=self.model.attn_mask)
-    x = x.permute(1, 0, 2)  # LND -> NLD
-    x = self.model.ln_final(x)
-    return x
-
-  def text_transformer_forward(self, x: torch.Tensor, attn_mask=None):
-    for i, r in enumerate(self.model.transformer.resblocks):
-      if i == len(self.model.transformer.resblocks) - self.layer_idx:
-        break
-      if self.model.transformer.grad_checkpointing and not torch.jit.is_scripting():
-        x = torch.utils.checkpoint(r, x, attn_mask)
-      else:
-        x = r(x, attn_mask=attn_mask)
-    return x
-
-  def encode(self, text):
-    return self(text)
-
-
-def convert_ldm_clip_checkpoint_v2(checkpoint):
-  # model, _, _ = open_clip.create_model_and_transforms(
-  #     V2_OPEN_CLIP_ARCH, device=torch.device('cpu'), pretrained=V2_OPEN_CLIP_VERSION)
-  # del model.visual
-  # text_model = model
-  text_model = FrozenOpenCLIPEmbedder(V2_OPEN_CLIP_ARCH, V2_OPEN_CLIP_VERSION, freeze=True, layer='penultimate')
-
-  keys = list(checkpoint.keys())
-
-  text_model_dict = {}
-
-  for key in keys:
-    if key.startswith("cond_stage_model."):
-      text_model_dict[key[len("cond_stage_model."):]] = checkpoint[key]
-
-  info = text_model.load_state_dict(text_model_dict)
-  print("cond stage loaded:", info)
-
-  return text_model
-
-
-def linear_tf_to_conv(checkpoint):
-  keys = list(checkpoint.keys())
-  tf_keys = ["proj_in.weight", "proj_out.weight"]
-  for key in keys:
-    if ".".join(key.split(".")[-2:]) in tf_keys:
-      if checkpoint[key].ndim == 2:
-        checkpoint[key] = checkpoint[key].unsqueeze(2).unsqueeze(2)
-
-
-def load_models_from_stable_diffusion_checkpoint_v2(ckpt_path, dtype=None):
-  checkpoint = load_checkpoint_with_conversion(ckpt_path)
-  state_dict = checkpoint["state_dict"]
-  if dtype is not None:
-    for k, v in state_dict.items():
-      if type(v) is torch.Tensor:
-        state_dict[k] = v.to(dtype)
-
-  # Convert the UNet2DConditionModel model.
-  unet_config = create_unet_diffusers_config_v2()
-  converted_unet_checkpoint = convert_ldm_unet_checkpoint(state_dict, unet_config)
-  linear_tf_to_conv(converted_unet_checkpoint)
-
-  unet = UNet2DConditionModelV2(**unet_config)
   info = unet.load_state_dict(converted_unet_checkpoint)
-  print("unet loaded", info)
+  print("loading u-net:", info)
 
   # Convert the VAE model.
   vae_config = create_vae_diffusers_config()
@@ -1434,511 +851,155 @@ def load_models_from_stable_diffusion_checkpoint_v2(ckpt_path, dtype=None):
 
   vae = AutoencoderKL(**vae_config)
   info = vae.load_state_dict(converted_vae_checkpoint)
-  print("vae loaded", info)
+  print("loadint vae:", info)
 
   # convert text_model
-  text_model = convert_ldm_clip_checkpoint_v2(state_dict)
+  if v2:
+    converted_text_encoder_checkpoint = convert_ldm_clip_checkpoint_v2(state_dict, 77)
+    cfg = CLIPTextConfig(
+        vocab_size=49408,
+        hidden_size=1024,
+        intermediate_size=4096,
+        num_hidden_layers=23,
+        num_attention_heads=16,
+        max_position_embeddings=77,
+        hidden_act="gelu",
+        layer_norm_eps=1e-05,
+        dropout=0.0,
+        attention_dropout=0.0,
+        initializer_range=0.02,
+        initializer_factor=1.0,
+        pad_token_id=1,
+        bos_token_id=0,
+        eos_token_id=2,
+        model_type="clip_text_model",
+        projection_dim=512,
+        torch_dtype="float32",
+        transformers_version="4.25.0.dev0",
+    )
+    text_model = CLIPTextModel._from_config(cfg)
+    info = text_model.load_state_dict(converted_text_encoder_checkpoint)
+  else:
+    converted_text_encoder_checkpoint = convert_ldm_clip_checkpoint_v1(state_dict)
+    text_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
+    info = text_model.load_state_dict(converted_text_encoder_checkpoint)
+  print("loading text encoder:", info)
 
   return text_model, vae, unet
 
 
-class DDIMScheduler(SchedulerMixin, ConfigMixin):
-  """
-  Denoising diffusion implicit models is a scheduler that extends the denoising procedure introduced in denoising
-  diffusion probabilistic models (DDPMs) with non-Markovian guidance.
-  [`~ConfigMixin`] takes care of storing all config attributes that are passed in the scheduler's `__init__`
-  function, such as `num_train_timesteps`. They can be accessed via `scheduler.config.num_train_timesteps`.
-  [`SchedulerMixin`] provides general loading and saving functionality via the [`SchedulerMixin.save_pretrained`] and
-  [`~SchedulerMixin.from_pretrained`] functions.
-  For more details, see the original paper: https://arxiv.org/abs/2010.02502
-  Args:
-      num_train_timesteps (`int`): number of diffusion steps used to train the model.
-      beta_start (`float`): the starting `beta` value of inference.
-      beta_end (`float`): the final `beta` value.
-      beta_schedule (`str`):
-          the beta schedule, a mapping from a beta range to a sequence of betas for stepping the model. Choose from
-          `linear`, `scaled_linear`, or `squaredcos_cap_v2`.
-      trained_betas (`np.ndarray`, optional):
-          option to pass an array of betas directly to the constructor to bypass `beta_start`, `beta_end` etc.
-      clip_sample (`bool`, default `True`):
-          option to clip predicted sample between -1 and 1 for numerical stability.
-      set_alpha_to_one (`bool`, default `True`):
-          each diffusion step uses the value of alphas product at that step and at the previous one. For the final
-          step there is no previous alpha. When this option is `True` the previous alpha product is fixed to `1`,
-          otherwise it uses the value of alpha at step 0.
-      steps_offset (`int`, default `0`):
-          an offset added to the inference steps. You can use a combination of `offset=1` and
-          `set_alpha_to_one=False`, to make the last step use step 0 for the previous alpha product, as done in
-          stable diffusion.
-  """
+def convert_text_encoder_state_dict_to_sd_v2(checkpoint):
+  def convert_key(key):
+    # position_idsの除去
+    if ".position_ids" in key:
+      return None
 
-  # _compatibles = _COMPATIBLE_STABLE_DIFFUSION_SCHEDULERS.copy()
+    # common
+    key = key.replace("text_model.encoder.", "transformer.")
+    key = key.replace("text_model.", "")
+    if "layers" in key:
+      # resblocks conversion
+      key = key.replace(".layers.", ".resblocks.")
+      if ".layer_norm" in key:
+        key = key.replace(".layer_norm", ".ln_")
+      elif ".mlp." in key:
+        key = key.replace(".fc1.", ".c_fc.")
+        key = key.replace(".fc2.", ".c_proj.")
+      elif '.self_attn.out_proj' in key:
+        key = key.replace(".self_attn.out_proj.", ".attn.out_proj.")
+      elif '.self_attn.' in key:
+        key = None                  # 特殊なので後で処理する
+      else:
+        raise ValueError(f"unexpected key in DiffUsers model: {key}")
+    elif '.position_embedding' in key:
+      key = key.replace("embeddings.position_embedding.weight", "positional_embedding")
+    elif '.token_embedding' in key:
+      key = key.replace("embeddings.token_embedding.weight", "token_embedding.weight")
+    elif 'final_layer_norm' in key:
+      key = key.replace("final_layer_norm", "ln_final")
+    return key
 
-  @register_to_config
-  def __init__(
-      self,
-      num_train_timesteps: int = 1000,
-      beta_start: float = 0.0001,
-      beta_end: float = 0.02,
-      beta_schedule: str = "linear",
-      trained_betas: Optional[np.ndarray] = None,
-      clip_sample: bool = True,
-      set_alpha_to_one: bool = True,
-      steps_offset: int = 0,
-      prediction_type: str = "epsilon",
-  ):
-    if trained_betas is not None:
-      self.betas = torch.from_numpy(trained_betas)
-    elif beta_schedule == "linear":
-      self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
-    elif beta_schedule == "scaled_linear":
-      # this schedule is very specific to the latent diffusion model.
-      self.betas = (
-          torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
-      )
-    elif beta_schedule == "squaredcos_cap_v2":
-      # Glide cosine schedule
-      self.betas = betas_for_alpha_bar(num_train_timesteps)
-    else:
-      raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
+  keys = list(checkpoint.keys())
+  new_sd = {}
+  for key in keys:
+    new_key = convert_key(key)
+    if new_key is None:
+      continue
+    new_sd[new_key] = checkpoint[key]
 
-    self.prediction_type = prediction_type
+  # attnの変換
+  for key in keys:
+    if 'layers' in key and 'q_proj' in key:
+      # 三つを結合
+      key_q = key
+      key_k = key.replace("q_proj", "k_proj")
+      key_v = key.replace("q_proj", "v_proj")
 
-    self.alphas = 1.0 - self.betas
-    self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+      value_q = checkpoint[key_q]
+      value_k = checkpoint[key_k]
+      value_v = checkpoint[key_v]
+      value = torch.cat([value_q, value_k, value_v])
 
-    # At every step in ddim, we are looking into the previous alphas_cumprod
-    # For the final step, there is no previous alphas_cumprod because we are already at 0
-    # `set_alpha_to_one` decides whether we set this parameter simply to one or
-    # whether we use the final alpha of the "non-previous" one.
-    self.final_alpha_cumprod = torch.tensor(1.0) if set_alpha_to_one else self.alphas_cumprod[0]
+      new_key = key.replace("text_model.encoder.layers.", "transformer.resblocks.")
+      new_key = new_key.replace(".self_attn.q_proj.", ".attn.in_proj_")
+      new_sd[new_key] = value
 
-    # standard deviation of the initial noise distribution
-    self.init_noise_sigma = 1.0
-
-    # setable values
-    self.num_inference_steps = None
-    self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
-
-    # replace randn entry point
-    self.randn = torch.randn
+  return new_sd
 
 
-  def scale_model_input(self, sample: torch.FloatTensor, timestep: Optional[int] = None) -> torch.FloatTensor:
-    """
-    Ensures interchangeability with schedulers that need to scale the denoising model input depending on the
-    current timestep.
-    Args:
-        sample (`torch.FloatTensor`): input sample
-        timestep (`int`, optional): current timestep
-    Returns:
-        `torch.FloatTensor`: scaled input sample
-    """
-    return sample
+def save_stable_diffusion_checkpoint(v2, output_file, text_encoder, unet, ckpt_path, epochs, steps, save_dtype=None):
+  # VAEがメモリ上にないので、もう一度VAEを含めて読み込む
+  checkpoint = load_checkpoint_with_text_encoder_conversion(ckpt_path)
+  state_dict = checkpoint["state_dict"]
 
-  def _get_variance(self, timestep, prev_timestep):
-    alpha_prod_t = self.alphas_cumprod[timestep]
-    alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
-    beta_prod_t = 1 - alpha_prod_t
-    beta_prod_t_prev = 1 - alpha_prod_t_prev
+  def assign_new_sd(prefix, sd):
+    for k, v in sd.items():
+      key = prefix + k
+      assert key in state_dict, f"Illegal key in save SD: {key}"
+      if save_dtype is not None:
+        v = v.detach().clone().to("cpu").to(save_dtype)
+      state_dict[key] = v
 
-    variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+  # Convert the UNet model
+  unet_state_dict = convert_unet_state_dict_to_sd(v2, unet.state_dict())
+  assign_new_sd("model.diffusion_model.", unet_state_dict)
 
-    return variance
+  # Convert the text encoder model
+  if v2:
+    text_enc_dict = convert_text_encoder_state_dict_to_sd_v2(text_encoder.state_dict())
+    assign_new_sd("cond_stage_model.model.", text_enc_dict)
+  else:
+    text_enc_dict = text_encoder.state_dict()
+    assign_new_sd("cond_stage_model.transformer.", text_enc_dict)
 
-  def set_timesteps(self, num_inference_steps: int, device: Union[str, torch.device] = None):
-    """
-    Sets the discrete timesteps used for the diffusion chain. Supporting function to be run before inference.
-    Args:
-        num_inference_steps (`int`):
-            the number of diffusion steps used when generating samples with a pre-trained model.
-    """
-    self.num_inference_steps = num_inference_steps
-    step_ratio = self.config.num_train_timesteps // self.num_inference_steps
-    # creates integer timesteps by multiplying by ratio
-    # casting to int to avoid issues when num_inference_step is power of 3
-    timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
-    self.timesteps = torch.from_numpy(timesteps).to(device)
-    self.timesteps += self.config.steps_offset
+  # Put together new checkpoint
+  new_ckpt = {'state_dict': state_dict}
 
-  def step(
-      self,
-      model_output: torch.FloatTensor,
-      timestep: int,
-      sample: torch.FloatTensor,
-      eta: float = 0.0,
-      use_clipped_model_output: bool = False,
-      generator=None,
-      variance_noise: Optional[torch.FloatTensor] = None,
-      return_dict: bool = True,
-  ) -> Union[diffusers.schedulers.scheduling_ddim.DDIMSchedulerOutput, Tuple]:
-    """
-    Predict the sample at the previous timestep by reversing the SDE. Core function to propagate the diffusion
-    process from the learned model outputs (most often the predicted noise).
-    Args:
-        model_output (`torch.FloatTensor`): direct output from learned diffusion model.
-        timestep (`int`): current discrete timestep in the diffusion chain.
-        sample (`torch.FloatTensor`):
-            current instance of sample being created by diffusion process.
-        eta (`float`): weight of noise for added noise in diffusion step.
-        use_clipped_model_output (`bool`): if `True`, compute "corrected" `model_output` from the clipped
-            predicted original sample. Necessary because predicted original sample is clipped to [-1, 1] when
-            `self.config.clip_sample` is `True`. If no clipping has happened, "corrected" `model_output` would
-            coincide with the one provided as input and `use_clipped_model_output` will have not effect.
-        generator: random number generator.
-        variance_noise (`torch.FloatTensor`): instead of generating noise for the variance using `generator`, we
-            can directly provide the noise for the variance itself. This is useful for methods such as
-            CycleDiffusion. (https://arxiv.org/abs/2210.05559)
-        return_dict (`bool`): option for returning tuple rather than DDIMSchedulerOutput class
-    Returns:
-        [`~schedulers.scheduling_utils.DDIMSchedulerOutput`] or `tuple`:
-        [`~schedulers.scheduling_utils.DDIMSchedulerOutput`] if `return_dict` is True, otherwise a `tuple`. When
-        returning a tuple, the first element is the sample tensor.
-    """
-    if self.num_inference_steps is None:
-      raise ValueError(
-          "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
-      )
+  if 'epoch' in checkpoint:
+    epochs += checkpoint['epoch']
+  if 'global_step' in checkpoint:
+    steps += checkpoint['global_step']
 
-    # See formulas (12) and (16) of DDIM paper https://arxiv.org/pdf/2010.02502.pdf
-    # Ideally, read DDIM paper in-detail understanding
+  new_ckpt['epoch'] = epochs
+  new_ckpt['global_step'] = steps
 
-    # Notation (<variable name> -> <name in paper>
-    # - pred_noise_t -> e_theta(x_t, t)
-    # - pred_original_sample -> f_theta(x_t, t) or x_0
-    # - std_dev_t -> sigma_t
-    # - eta -> η
-    # - pred_sample_direction -> "direction pointing to x_t"
-    # - pred_prev_sample -> "x_t-1"
+  torch.save(new_ckpt, output_file)
 
-    # 1. get previous step value (=t-1)
-    prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
 
-    # 2. compute alphas, betas
-    alpha_prod_t = self.alphas_cumprod[timestep]
-    alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
-
-    beta_prod_t = 1 - alpha_prod_t
-
-    # 3. compute predicted original sample from predicted noise also called
-    # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-    if self.prediction_type == "epsilon":
-      pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-    elif self.prediction_type == "sample":
-      pred_original_sample = model_output
-    elif self.prediction_type == "v_prediction":
-      pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
-      # predict V
-      model_output = (alpha_prod_t**0.5) * model_output + (beta_prod_t**0.5) * sample
-    else:
-      raise ValueError(
-          f"prediction_type given as {self.prediction_type} must be one of `epsilon`, `sample`, or"
-          " `v_prediction`"
-      )
-
-    # 4. Clip "predicted x_0"
-    if self.config.clip_sample:
-      pred_original_sample = torch.clamp(pred_original_sample, -1, 1)
-
-    # 5. compute variance: "sigma_t(η)" -> see formula (16)
-    # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
-    variance = self._get_variance(timestep, prev_timestep)
-    std_dev_t = eta * variance ** (0.5)
-
-    if use_clipped_model_output:
-      # the model_output is always re-derived from the clipped x_0 in Glide
-      model_output = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
-
-    # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-    pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * model_output
-
-    # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
-    prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
-
-    if eta > 0:
-      # randn_like does not support generator https://github.com/pytorch/pytorch/issues/27072
-      device = model_output.device
-      if variance_noise is not None and generator is not None:
-        raise ValueError(
-            "Cannot pass both generator and variance_noise. Please make sure that either `generator` or"
-            " `variance_noise` stays `None`."
-        )
-
-      if variance_noise is None:
-        if device.type == "mps":
-          # randn does not work reproducibly on mps
-          variance_noise = self.randn(model_output.shape, dtype=model_output.dtype, generator=generator)
-          variance_noise = variance_noise.to(device)
-        else:
-          variance_noise = self.randn(
-              model_output.shape, generator=generator, device=device, dtype=model_output.dtype
-          )
-      variance = self._get_variance(timestep, prev_timestep) ** (0.5) * eta * variance_noise
-
-      prev_sample = prev_sample + variance
-
-    if not return_dict:
-      return (prev_sample,)
-
-    return diffusers.schedulers.scheduling_ddim.DDIMSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
-
-  def add_noise(
-      self,
-      original_samples: torch.FloatTensor,
-      noise: torch.FloatTensor,
-      timesteps: torch.IntTensor,
-  ) -> torch.FloatTensor:
-    # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
-    self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device, dtype=original_samples.dtype)
-    timesteps = timesteps.to(original_samples.device)
-
-    sqrt_alpha_prod = self.alphas_cumprod[timesteps] ** 0.5
-    sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-    while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
-      sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-
-    sqrt_one_minus_alpha_prod = (1 - self.alphas_cumprod[timesteps]) ** 0.5
-    sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-    while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
-      sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
-
-    noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
-    return noisy_samples
-
-  def __len__(self):
-    return self.config.num_train_timesteps
+def save_diffusers_checkpoint(v2, output_dir, text_encoder, unet, pretrained_model_name_or_path, save_dtype):
+  pipeline = StableDiffusionPipeline(
+      unet=unet,
+      text_encoder=text_encoder,
+      vae=AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae"),
+      scheduler=DDIMScheduler.from_pretrained(pretrained_model_name_or_path, subfolder="scheduler"),
+      tokenizer=CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer"),
+      safety_checker=None,
+      feature_extractor=None,
+      requires_safety_checker=None,
+  )
+  pipeline.save_pretrained(output_dir)
 
 # endregion
-
-
-class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
-  """
-  Euler scheduler (Algorithm 2) from Karras et al. (2022) https://arxiv.org/abs/2206.00364. . Based on the original
-  k-diffusion implementation by Katherine Crowson:
-  https://github.com/crowsonkb/k-diffusion/blob/481677d114f6ea445aa009cf5bd7a9cdee909e47/k_diffusion/sampling.py#L51
-  [`~ConfigMixin`] takes care of storing all config attributes that are passed in the scheduler's `__init__`
-  function, such as `num_train_timesteps`. They can be accessed via `scheduler.config.num_train_timesteps`.
-  [`SchedulerMixin`] provides general loading and saving functionality via the [`SchedulerMixin.save_pretrained`] and
-  [`~SchedulerMixin.from_pretrained`] functions.
-  Args:
-      num_train_timesteps (`int`): number of diffusion steps used to train the model.
-      beta_start (`float`): the starting `beta` value of inference.
-      beta_end (`float`): the final `beta` value.
-      beta_schedule (`str`):
-          the beta schedule, a mapping from a beta range to a sequence of betas for stepping the model. Choose from
-          `linear` or `scaled_linear`.
-      trained_betas (`np.ndarray`, optional):
-          option to pass an array of betas directly to the constructor to bypass `beta_start`, `beta_end` etc.
-  """
-
-  # _compatibles = _COMPATIBLE_STABLE_DIFFUSION_SCHEDULERS.copy()
-
-  @register_to_config
-  def __init__(
-      self,
-      num_train_timesteps: int = 1000,
-      beta_start: float = 0.0001,
-      beta_end: float = 0.02,
-      beta_schedule: str = "linear",
-      trained_betas: Optional[np.ndarray] = None,
-      prediction_type: str = "epsilon",
-  ):
-    if trained_betas is not None:
-      self.betas = torch.from_numpy(trained_betas)
-    elif beta_schedule == "linear":
-      self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
-    elif beta_schedule == "scaled_linear":
-      # this schedule is very specific to the latent diffusion model.
-      self.betas = (
-          torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
-      )
-    else:
-      raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
-
-    self.prediction_type = prediction_type
-
-    self.alphas = 1.0 - self.betas
-    self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-
-    sigmas = np.array(((1 - self.alphas_cumprod) / self.alphas_cumprod) ** 0.5)
-    sigmas = np.concatenate([sigmas[::-1], [0.0]]).astype(np.float32)
-    self.sigmas = torch.from_numpy(sigmas)
-
-    # standard deviation of the initial noise distribution
-    self.init_noise_sigma = self.sigmas.max()
-
-    # setable values
-    self.num_inference_steps = None
-    timesteps = np.linspace(0, num_train_timesteps - 1, num_train_timesteps, dtype=float)[::-1].copy()
-    self.timesteps = torch.from_numpy(timesteps)
-    self.is_scale_input_called = False
-
-    # replace randn entry point
-    self.randn = torch.randn
-
-  def scale_model_input(
-      self, sample: torch.FloatTensor, timestep: Union[float, torch.FloatTensor]
-  ) -> torch.FloatTensor:
-    """
-    Scales the denoising model input by `(sigma**2 + 1) ** 0.5` to match the Euler algorithm.
-    Args:
-        sample (`torch.FloatTensor`): input sample
-        timestep (`float` or `torch.FloatTensor`): the current timestep in the diffusion chain
-    Returns:
-        `torch.FloatTensor`: scaled input sample
-    """
-    if isinstance(timestep, torch.Tensor):
-      timestep = timestep.to(self.timesteps.device)
-    step_index = (self.timesteps == timestep).nonzero().item()
-    sigma = self.sigmas[step_index]
-    sample = sample / ((sigma**2 + 1) ** 0.5)
-    self.is_scale_input_called = True
-    return sample
-
-  def set_timesteps(self, num_inference_steps: int, device: Union[str, torch.device] = None):
-    """
-    Sets the timesteps used for the diffusion chain. Supporting function to be run before inference.
-    Args:
-        num_inference_steps (`int`):
-            the number of diffusion steps used when generating samples with a pre-trained model.
-        device (`str` or `torch.device`, optional):
-            the device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
-    """
-    self.num_inference_steps = num_inference_steps
-
-    timesteps = np.linspace(0, self.config.num_train_timesteps - 1, num_inference_steps, dtype=float)[::-1].copy()
-    sigmas = np.array(((1 - self.alphas_cumprod) / self.alphas_cumprod) ** 0.5)
-    sigmas = np.interp(timesteps, np.arange(0, len(sigmas)), sigmas)
-    sigmas = np.concatenate([sigmas, [0.0]]).astype(np.float32)
-    self.sigmas = torch.from_numpy(sigmas).to(device=device)
-    if str(device).startswith("mps"):
-      # mps does not support float64
-      self.timesteps = torch.from_numpy(timesteps).to(device, dtype=torch.float32)
-    else:
-      self.timesteps = torch.from_numpy(timesteps).to(device=device)
-
-  def step(
-      self,
-      model_output: torch.FloatTensor,
-      timestep: Union[float, torch.FloatTensor],
-      sample: torch.FloatTensor,
-      s_churn: float = 0.0,
-      s_tmin: float = 0.0,
-      s_tmax: float = float("inf"),
-      s_noise: float = 1.0,
-      generator: Optional[torch.Generator] = None,
-      return_dict: bool = True,
-  ) -> Union[diffusers.schedulers.scheduling_euler_discrete. EulerDiscreteSchedulerOutput, Tuple]:
-    """
-    Predict the sample at the previous timestep by reversing the SDE. Core function to propagate the diffusion
-    process from the learned model outputs (most often the predicted noise).
-    Args:
-        model_output (`torch.FloatTensor`): direct output from learned diffusion model.
-        timestep (`float`): current timestep in the diffusion chain.
-        sample (`torch.FloatTensor`):
-            current instance of sample being created by diffusion process.
-        s_churn (`float`)
-        s_tmin  (`float`)
-        s_tmax  (`float`)
-        s_noise (`float`)
-        generator (`torch.Generator`, optional): Random number generator.
-        return_dict (`bool`): option for returning tuple rather than EulerDiscreteSchedulerOutput class
-    Returns:
-        [`~schedulers.scheduling_utils.EulerDiscreteSchedulerOutput`] or `tuple`:
-        [`~schedulers.scheduling_utils.EulerDiscreteSchedulerOutput`] if `return_dict` is True, otherwise a
-        `tuple`. When returning a tuple, the first element is the sample tensor.
-    """
-
-    if (
-        isinstance(timestep, int)
-        or isinstance(timestep, torch.IntTensor)
-        or isinstance(timestep, torch.LongTensor)
-    ):
-      raise ValueError(
-          "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
-          " `EulerDiscreteScheduler.step()` is not supported. Make sure to pass"
-          " one of the `scheduler.timesteps` as a timestep.",
-      )
-
-    if not self.is_scale_input_called:
-      # logger.warning(
-      print(
-          "The `scale_model_input` function should be called before `step` to ensure correct denoising. "
-          "See `StableDiffusionPipeline` for a usage example."
-      )
-
-    if isinstance(timestep, torch.Tensor):
-      timestep = timestep.to(self.timesteps.device)
-
-    step_index = (self.timesteps == timestep).nonzero().item()
-    sigma = self.sigmas[step_index]
-
-    gamma = min(s_churn / (len(self.sigmas) - 1), 2**0.5 - 1) if s_tmin <= sigma <= s_tmax else 0.0
-
-    device = model_output.device
-    if device.type == "mps":
-      # randn does not work reproducibly on mps
-      noise = self.randn(model_output.shape, dtype=model_output.dtype, device="cpu", generator=generator).to(device)
-    else:
-      noise = self.randn(model_output.shape, dtype=model_output.dtype, device=device, generator=generator).to(device)
-
-    eps = noise * s_noise
-    sigma_hat = sigma * (gamma + 1)
-
-    if gamma > 0:
-      sample = sample + eps * (sigma_hat**2 - sigma**2) ** 0.5
-
-    # 1. compute predicted original sample (x_0) from sigma-scaled predicted noise
-    if self.prediction_type == "epsilon":
-      pred_original_sample = sample - sigma_hat * model_output
-    elif self.prediction_type == "v_prediction":
-      # * c_out + input * c_skip
-      pred_original_sample = model_output * (-sigma / (sigma**2 + 1) ** 0.5) + (sample / (sigma**2 + 1))
-    else:
-      raise ValueError(
-          f"prediction_type given as {self.prediction_type} must be one of `epsilon`, or `v_prediction`"
-      )
-
-    # 2. Convert to an ODE derivative
-    derivative = (sample - pred_original_sample) / sigma_hat
-
-    dt = self.sigmas[step_index + 1] - sigma_hat
-
-    prev_sample = sample + derivative * dt
-
-    if not return_dict:
-      return (prev_sample,)
-
-    return diffusers.schedulers.scheduling_euler_discrete.EulerDiscreteSchedulerOutput(prev_sample=prev_sample, pred_original_sample=pred_original_sample)
-
-  def add_noise(
-      self,
-      original_samples: torch.FloatTensor,
-      noise: torch.FloatTensor,
-      timesteps: torch.FloatTensor,
-  ) -> torch.FloatTensor:
-    # Make sure sigmas and timesteps have the same device and dtype as original_samples
-    self.sigmas = self.sigmas.to(device=original_samples.device, dtype=original_samples.dtype)
-    if original_samples.device.type == "mps" and torch.is_floating_point(timesteps):
-      # mps does not support float64
-      self.timesteps = self.timesteps.to(original_samples.device, dtype=torch.float32)
-      timesteps = timesteps.to(original_samples.device, dtype=torch.float32)
-    else:
-      self.timesteps = self.timesteps.to(original_samples.device)
-      timesteps = timesteps.to(original_samples.device)
-
-    schedule_timesteps = self.timesteps
-    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-
-    sigma = self.sigmas[step_indices].flatten()
-    while len(sigma.shape) < len(original_samples.shape):
-      sigma = sigma.unsqueeze(-1)
-
-    noisy_samples = original_samples + noise * sigma
-    return noisy_samples
-
-  def __len__(self):
-    return self.config.num_train_timesteps
 
 
 # region モジュール入れ替え部
@@ -2222,477 +1283,6 @@ def replace_unet_cross_attn_to_xformers():
 # Pipelineだけ独立して使えないのと機能追加するのとでコピーして修正
 
 
-# region DPM solver scheduler
-# copy from https://github.com/huggingface/diffusers/blob/main/src/diffusers/schedulers/scheduling_dpmsolver_multistep.py
-# あとでDiffusersのリリースに含まれたら消す
-
-
-# Copyright 2022 TSAIL Team and The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# DISCLAIMER: This file is strongly influenced by https://github.com/LuChengTHU/dpm-solver
-
-
-def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999):
-  """
-  Create a beta schedule that discretizes the given alpha_t_bar function, which defines the cumulative product of
-  (1-beta) over time from t = [0,1].
-  Contains a function alpha_bar that takes an argument t and transforms it to the cumulative product of (1-beta) up
-  to that part of the diffusion process.
-  Args:
-      num_diffusion_timesteps (`int`): the number of betas to produce.
-      max_beta (`float`): the maximum beta to use; use values lower than 1 to
-                   prevent singularities.
-  Returns:
-      betas (`np.ndarray`): the betas used by the scheduler to step the model outputs
-  """
-
-  def alpha_bar(time_step):
-    return math.cos((time_step + 0.008) / 1.008 * math.pi / 2) ** 2
-
-  betas = []
-  for i in range(num_diffusion_timesteps):
-    t1 = i / num_diffusion_timesteps
-    t2 = (i + 1) / num_diffusion_timesteps
-    betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
-  return torch.tensor(betas, dtype=torch.float32)
-
-
-class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
-  """
-  DPM-Solver (and the improved version DPM-Solver++) is a fast dedicated high-order solver for diffusion ODEs with
-  the convergence order guarantee. Empirically, sampling by DPM-Solver with only 20 steps can generate high-quality
-  samples, and it can generate quite good samples even in only 10 steps.
-  For more details, see the original paper: https://arxiv.org/abs/2206.00927 and https://arxiv.org/abs/2211.01095
-  Currently, we support the multistep DPM-Solver for both noise prediction models and data prediction models. We
-  recommend to use `solver_order=2` for guided sampling, and `solver_order=3` for unconditional sampling.
-  We also support the "dynamic thresholding" method in Imagen (https://arxiv.org/abs/2205.11487). For pixel-space
-  diffusion models, you can set both `algorithm_type="dpmsolver++"` and `thresholding=True` to use the dynamic
-  thresholding. Note that the thresholding method is unsuitable for latent-space diffusion models (such as
-  stable-diffusion).
-  [`~ConfigMixin`] takes care of storing all config attributes that are passed in the scheduler's `__init__`
-  function, such as `num_train_timesteps`. They can be accessed via `scheduler.config.num_train_timesteps`.
-  [`SchedulerMixin`] provides general loading and saving functionality via the [`SchedulerMixin.save_pretrained`] and
-  [`~SchedulerMixin.from_pretrained`] functions.
-  Args:
-      num_train_timesteps (`int`): number of diffusion steps used to train the model.
-      beta_start (`float`): the starting `beta` value of inference.
-      beta_end (`float`): the final `beta` value.
-      beta_schedule (`str`):
-          the beta schedule, a mapping from a beta range to a sequence of betas for stepping the model. Choose from
-          `linear`, `scaled_linear`, or `squaredcos_cap_v2`.
-      trained_betas (`np.ndarray`, optional):
-          option to pass an array of betas directly to the constructor to bypass `beta_start`, `beta_end` etc.
-      solver_order (`int`, default `2`):
-          the order of DPM-Solver; can be `1` or `2` or `3`. We recommend to use `solver_order=2` for guided
-          sampling, and `solver_order=3` for unconditional sampling.
-      predict_epsilon (`bool`, default `True`):
-          we currently support both the noise prediction model and the data prediction model. If the model predicts
-          the noise / epsilon, set `predict_epsilon` to `True`. If the model predicts the data / x0 directly, set
-          `predict_epsilon` to `False`.
-      thresholding (`bool`, default `False`):
-          whether to use the "dynamic thresholding" method (introduced by Imagen, https://arxiv.org/abs/2205.11487).
-          For pixel-space diffusion models, you can set both `algorithm_type=dpmsolver++` and `thresholding=True` to
-          use the dynamic thresholding. Note that the thresholding method is unsuitable for latent-space diffusion
-          models (such as stable-diffusion).
-      dynamic_thresholding_ratio (`float`, default `0.995`):
-          the ratio for the dynamic thresholding method. Default is `0.995`, the same as Imagen
-          (https://arxiv.org/abs/2205.11487).
-      sample_max_value (`float`, default `1.0`):
-          the threshold value for dynamic thresholding. Valid only when `thresholding=True` and
-          `algorithm_type="dpmsolver++`.
-      algorithm_type (`str`, default `dpmsolver++`):
-          the algorithm type for the solver. Either `dpmsolver` or `dpmsolver++`. The `dpmsolver` type implements the
-          algorithms in https://arxiv.org/abs/2206.00927, and the `dpmsolver++` type implements the algorithms in
-          https://arxiv.org/abs/2211.01095. We recommend to use `dpmsolver++` with `solver_order=2` for guided
-          sampling (e.g. stable-diffusion).
-      solver_type (`str`, default `midpoint`):
-          the solver type for the second-order solver. Either `midpoint` or `heun`. The solver type slightly affects
-          the sample quality, especially for small number of steps. We empirically find that `midpoint` solvers are
-          slightly better, so we recommend to use the `midpoint` type.
-      lower_order_final (`bool`, default `True`):
-          whether to use lower-order solvers in the final steps. Only valid for < 15 inference steps. We empirically
-          find this trick can stabilize the sampling of DPM-Solver for steps < 15, especially for steps <= 10.
-  """
-
-  # _compatibles = _COMPATIBLE_STABLE_DIFFUSION_SCHEDULERS.copy()
-
-  @register_to_config
-  def __init__(
-      self,
-      num_train_timesteps: int = 1000,
-      beta_start: float = 0.0001,
-      beta_end: float = 0.02,
-      beta_schedule: str = "linear",
-      trained_betas: Optional[np.ndarray] = None,
-      solver_order: int = 2,
-      predict_epsilon: bool = True,
-      thresholding: bool = False,
-      dynamic_thresholding_ratio: float = 0.995,
-      sample_max_value: float = 1.0,
-      algorithm_type: str = "dpmsolver++",
-      solver_type: str = "midpoint",
-      lower_order_final: bool = True,
-  ):
-    if trained_betas is not None:
-      self.betas = torch.from_numpy(trained_betas)
-    elif beta_schedule == "linear":
-      self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
-    elif beta_schedule == "scaled_linear":
-      # this schedule is very specific to the latent diffusion model.
-      self.betas = (
-          torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
-      )
-    elif beta_schedule == "squaredcos_cap_v2":
-      # Glide cosine schedule
-      self.betas = betas_for_alpha_bar(num_train_timesteps)
-    else:
-      raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
-
-    self.alphas = 1.0 - self.betas
-    self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-    # Currently we only support VP-type noise schedule
-    self.alpha_t = torch.sqrt(self.alphas_cumprod)
-    self.sigma_t = torch.sqrt(1 - self.alphas_cumprod)
-    self.lambda_t = torch.log(self.alpha_t) - torch.log(self.sigma_t)
-
-    # standard deviation of the initial noise distribution
-    self.init_noise_sigma = 1.0
-
-    # settings for DPM-Solver
-    if algorithm_type not in ["dpmsolver", "dpmsolver++"]:
-      raise NotImplementedError(f"{algorithm_type} does is not implemented for {self.__class__}")
-    if solver_type not in ["midpoint", "heun"]:
-      raise NotImplementedError(f"{solver_type} does is not implemented for {self.__class__}")
-
-    # setable values
-    self.num_inference_steps = None
-    timesteps = np.linspace(0, num_train_timesteps - 1, num_train_timesteps, dtype=np.float32)[::-1].copy()
-    self.timesteps = torch.from_numpy(timesteps)
-    self.model_outputs = [None] * solver_order
-    self.lower_order_nums = 0
-
-  def set_timesteps(self, num_inference_steps: int, device: Union[str, torch.device] = None):
-    """
-    Sets the timesteps used for the diffusion chain. Supporting function to be run before inference.
-    Args:
-        num_inference_steps (`int`):
-            the number of diffusion steps used when generating samples with a pre-trained model.
-        device (`str` or `torch.device`, optional):
-            the device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
-    """
-    self.num_inference_steps = num_inference_steps
-    timesteps = (
-        np.linspace(0, self.num_train_timesteps - 1, num_inference_steps + 1)
-        .round()[::-1][:-1]
-        .copy()
-        .astype(np.int64)
-    )
-    self.timesteps = torch.from_numpy(timesteps).to(device)
-    self.model_outputs = [
-        None,
-    ] * self.config.solver_order
-    self.lower_order_nums = 0
-
-  def convert_model_output(
-      self, model_output: torch.FloatTensor, timestep: int, sample: torch.FloatTensor
-  ) -> torch.FloatTensor:
-    """
-    Convert the model output to the corresponding type that the algorithm (DPM-Solver / DPM-Solver++) needs.
-    DPM-Solver is designed to discretize an integral of the noise prediciton model, and DPM-Solver++ is designed to
-    discretize an integral of the data prediction model. So we need to first convert the model output to the
-    corresponding type to match the algorithm.
-    Note that the algorithm type and the model type is decoupled. That is to say, we can use either DPM-Solver or
-    DPM-Solver++ for both noise prediction model and data prediction model.
-    Args:
-        model_output (`torch.FloatTensor`): direct output from learned diffusion model.
-        timestep (`int`): current discrete timestep in the diffusion chain.
-        sample (`torch.FloatTensor`):
-            current instance of sample being created by diffusion process.
-    Returns:
-        `torch.FloatTensor`: the converted model output.
-    """
-    # DPM-Solver++ needs to solve an integral of the data prediction model.
-    if self.config.algorithm_type == "dpmsolver++":
-      if self.config.predict_epsilon:
-        alpha_t, sigma_t = self.alpha_t[timestep], self.sigma_t[timestep]
-        x0_pred = (sample - sigma_t * model_output) / alpha_t
-      else:
-        x0_pred = model_output
-      if self.config.thresholding:
-        # Dynamic thresholding in https://arxiv.org/abs/2205.11487
-        dynamic_max_val = torch.quantile(
-            torch.abs(x0_pred).reshape((x0_pred.shape[0], -1)), self.config.dynamic_thresholding_ratio, dim=1
-        )
-        dynamic_max_val = torch.maximum(
-            dynamic_max_val,
-            self.config.sample_max_value * torch.ones_like(dynamic_max_val).to(dynamic_max_val.device),
-        )[(...,) + (None,) * (x0_pred.ndim - 1)]
-        x0_pred = torch.clamp(x0_pred, -dynamic_max_val, dynamic_max_val) / dynamic_max_val
-      return x0_pred
-    # DPM-Solver needs to solve an integral of the noise prediction model.
-    elif self.config.algorithm_type == "dpmsolver":
-      if self.config.predict_epsilon:
-        return model_output
-      else:
-        alpha_t, sigma_t = self.alpha_t[timestep], self.sigma_t[timestep]
-        epsilon = (sample - alpha_t * model_output) / sigma_t
-        return epsilon
-
-  def dpm_solver_first_order_update(
-      self,
-      model_output: torch.FloatTensor,
-      timestep: int,
-      prev_timestep: int,
-      sample: torch.FloatTensor,
-  ) -> torch.FloatTensor:
-    """
-    One step for the first-order DPM-Solver (equivalent to DDIM).
-    See https://arxiv.org/abs/2206.00927 for the detailed derivation.
-    Args:
-        model_output (`torch.FloatTensor`): direct output from learned diffusion model.
-        timestep (`int`): current discrete timestep in the diffusion chain.
-        prev_timestep (`int`): previous discrete timestep in the diffusion chain.
-        sample (`torch.FloatTensor`):
-            current instance of sample being created by diffusion process.
-    Returns:
-        `torch.FloatTensor`: the sample tensor at the previous timestep.
-    """
-    lambda_t, lambda_s = self.lambda_t[prev_timestep], self.lambda_t[timestep]
-    alpha_t, alpha_s = self.alpha_t[prev_timestep], self.alpha_t[timestep]
-    sigma_t, sigma_s = self.sigma_t[prev_timestep], self.sigma_t[timestep]
-    h = lambda_t - lambda_s
-    if self.config.algorithm_type == "dpmsolver++":
-      x_t = (sigma_t / sigma_s) * sample - (alpha_t * (torch.exp(-h) - 1.0)) * model_output
-    elif self.config.algorithm_type == "dpmsolver":
-      x_t = (alpha_t / alpha_s) * sample - (sigma_t * (torch.exp(h) - 1.0)) * model_output
-    return x_t
-
-  def multistep_dpm_solver_second_order_update(
-      self,
-      model_output_list: List[torch.FloatTensor],
-      timestep_list: List[int],
-      prev_timestep: int,
-      sample: torch.FloatTensor,
-  ) -> torch.FloatTensor:
-    """
-    One step for the second-order multistep DPM-Solver.
-    Args:
-        model_output_list (`List[torch.FloatTensor]`):
-            direct outputs from learned diffusion model at current and latter timesteps.
-        timestep (`int`): current and latter discrete timestep in the diffusion chain.
-        prev_timestep (`int`): previous discrete timestep in the diffusion chain.
-        sample (`torch.FloatTensor`):
-            current instance of sample being created by diffusion process.
-    Returns:
-        `torch.FloatTensor`: the sample tensor at the previous timestep.
-    """
-    t, s0, s1 = prev_timestep, timestep_list[-1], timestep_list[-2]
-    m0, m1 = model_output_list[-1], model_output_list[-2]
-    lambda_t, lambda_s0, lambda_s1 = self.lambda_t[t], self.lambda_t[s0], self.lambda_t[s1]
-    alpha_t, alpha_s0 = self.alpha_t[t], self.alpha_t[s0]
-    sigma_t, sigma_s0 = self.sigma_t[t], self.sigma_t[s0]
-    h, h_0 = lambda_t - lambda_s0, lambda_s0 - lambda_s1
-    r0 = h_0 / h
-    D0, D1 = m0, (1.0 / r0) * (m0 - m1)
-    if self.config.algorithm_type == "dpmsolver++":
-      # See https://arxiv.org/abs/2211.01095 for detailed derivations
-      if self.config.solver_type == "midpoint":
-        x_t = (
-            (sigma_t / sigma_s0) * sample
-            - (alpha_t * (torch.exp(-h) - 1.0)) * D0
-            - 0.5 * (alpha_t * (torch.exp(-h) - 1.0)) * D1
-        )
-      elif self.config.solver_type == "heun":
-        x_t = (
-            (sigma_t / sigma_s0) * sample
-            - (alpha_t * (torch.exp(-h) - 1.0)) * D0
-            + (alpha_t * ((torch.exp(-h) - 1.0) / h + 1.0)) * D1
-        )
-    elif self.config.algorithm_type == "dpmsolver":
-      # See https://arxiv.org/abs/2206.00927 for detailed derivations
-      if self.config.solver_type == "midpoint":
-        x_t = (
-            (alpha_t / alpha_s0) * sample
-            - (sigma_t * (torch.exp(h) - 1.0)) * D0
-            - 0.5 * (sigma_t * (torch.exp(h) - 1.0)) * D1
-        )
-      elif self.config.solver_type == "heun":
-        x_t = (
-            (alpha_t / alpha_s0) * sample
-            - (sigma_t * (torch.exp(h) - 1.0)) * D0
-            - (sigma_t * ((torch.exp(h) - 1.0) / h - 1.0)) * D1
-        )
-    return x_t
-
-  def multistep_dpm_solver_third_order_update(
-      self,
-      model_output_list: List[torch.FloatTensor],
-      timestep_list: List[int],
-      prev_timestep: int,
-      sample: torch.FloatTensor,
-  ) -> torch.FloatTensor:
-    """
-    One step for the third-order multistep DPM-Solver.
-    Args:
-        model_output_list (`List[torch.FloatTensor]`):
-            direct outputs from learned diffusion model at current and latter timesteps.
-        timestep (`int`): current and latter discrete timestep in the diffusion chain.
-        prev_timestep (`int`): previous discrete timestep in the diffusion chain.
-        sample (`torch.FloatTensor`):
-            current instance of sample being created by diffusion process.
-    Returns:
-        `torch.FloatTensor`: the sample tensor at the previous timestep.
-    """
-    t, s0, s1, s2 = prev_timestep, timestep_list[-1], timestep_list[-2], timestep_list[-3]
-    m0, m1, m2 = model_output_list[-1], model_output_list[-2], model_output_list[-3]
-    lambda_t, lambda_s0, lambda_s1, lambda_s2 = (
-        self.lambda_t[t],
-        self.lambda_t[s0],
-        self.lambda_t[s1],
-        self.lambda_t[s2],
-    )
-    alpha_t, alpha_s0 = self.alpha_t[t], self.alpha_t[s0]
-    sigma_t, sigma_s0 = self.sigma_t[t], self.sigma_t[s0]
-    h, h_0, h_1 = lambda_t - lambda_s0, lambda_s0 - lambda_s1, lambda_s1 - lambda_s2
-    r0, r1 = h_0 / h, h_1 / h
-    D0 = m0
-    D1_0, D1_1 = (1.0 / r0) * (m0 - m1), (1.0 / r1) * (m1 - m2)
-    D1 = D1_0 + (r0 / (r0 + r1)) * (D1_0 - D1_1)
-    D2 = (1.0 / (r0 + r1)) * (D1_0 - D1_1)
-    if self.config.algorithm_type == "dpmsolver++":
-      # See https://arxiv.org/abs/2206.00927 for detailed derivations
-      x_t = (
-          (sigma_t / sigma_s0) * sample
-          - (alpha_t * (torch.exp(-h) - 1.0)) * D0
-          + (alpha_t * ((torch.exp(-h) - 1.0) / h + 1.0)) * D1
-          - (alpha_t * ((torch.exp(-h) - 1.0 + h) / h**2 - 0.5)) * D2
-      )
-    elif self.config.algorithm_type == "dpmsolver":
-      # See https://arxiv.org/abs/2206.00927 for detailed derivations
-      x_t = (
-          (alpha_t / alpha_s0) * sample
-          - (sigma_t * (torch.exp(h) - 1.0)) * D0
-          - (sigma_t * ((torch.exp(h) - 1.0) / h - 1.0)) * D1
-          - (sigma_t * ((torch.exp(h) - 1.0 - h) / h**2 - 0.5)) * D2
-      )
-    return x_t
-
-  def step(
-      self,
-      model_output: torch.FloatTensor,
-      timestep: int,
-      sample: torch.FloatTensor,
-      return_dict: bool = True,
-  ) -> Union[SchedulerOutput, Tuple]:
-    """
-    Step function propagating the sample with the multistep DPM-Solver.
-    Args:
-        model_output (`torch.FloatTensor`): direct output from learned diffusion model.
-        timestep (`int`): current discrete timestep in the diffusion chain.
-        sample (`torch.FloatTensor`):
-            current instance of sample being created by diffusion process.
-        return_dict (`bool`): option for returning tuple rather than SchedulerOutput class
-    Returns:
-        [`~scheduling_utils.SchedulerOutput`] or `tuple`: [`~scheduling_utils.SchedulerOutput`] if `return_dict` is
-        True, otherwise a `tuple`. When returning a tuple, the first element is the sample tensor.
-    """
-    if self.num_inference_steps is None:
-      raise ValueError(
-          "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
-      )
-
-    if isinstance(timestep, torch.Tensor):
-      timestep = timestep.to(self.timesteps.device)
-    step_index = (self.timesteps == timestep).nonzero()
-    if len(step_index) == 0:
-      step_index = len(self.timesteps) - 1
-    else:
-      step_index = step_index.item()
-    prev_timestep = 0 if step_index == len(self.timesteps) - 1 else self.timesteps[step_index + 1]
-    lower_order_final = (
-        (step_index == len(self.timesteps) - 1) and self.config.lower_order_final and len(self.timesteps) < 15
-    )
-    lower_order_second = (
-        (step_index == len(self.timesteps) - 2) and self.config.lower_order_final and len(self.timesteps) < 15
-    )
-
-    model_output = self.convert_model_output(model_output, timestep, sample)
-    for i in range(self.config.solver_order - 1):
-      self.model_outputs[i] = self.model_outputs[i + 1]
-    self.model_outputs[-1] = model_output
-
-    if self.config.solver_order == 1 or self.lower_order_nums < 1 or lower_order_final:
-      prev_sample = self.dpm_solver_first_order_update(model_output, timestep, prev_timestep, sample)
-    elif self.config.solver_order == 2 or self.lower_order_nums < 2 or lower_order_second:
-      timestep_list = [self.timesteps[step_index - 1], timestep]
-      prev_sample = self.multistep_dpm_solver_second_order_update(
-          self.model_outputs, timestep_list, prev_timestep, sample
-      )
-    else:
-      timestep_list = [self.timesteps[step_index - 2], self.timesteps[step_index - 1], timestep]
-      prev_sample = self.multistep_dpm_solver_third_order_update(
-          self.model_outputs, timestep_list, prev_timestep, sample
-      )
-
-    if self.lower_order_nums < self.config.solver_order:
-      self.lower_order_nums += 1
-
-    if not return_dict:
-      return (prev_sample,)
-
-    return SchedulerOutput(prev_sample=prev_sample)
-
-  def scale_model_input(self, sample: torch.FloatTensor, *args, **kwargs) -> torch.FloatTensor:
-    """
-    Ensures interchangeability with schedulers that need to scale the denoising model input depending on the
-    current timestep.
-    Args:
-        sample (`torch.FloatTensor`): input sample
-    Returns:
-        `torch.FloatTensor`: scaled input sample
-    """
-    return sample
-
-  def add_noise(
-      self,
-      original_samples: torch.FloatTensor,
-      noise: torch.FloatTensor,
-      timesteps: torch.IntTensor,
-  ) -> torch.FloatTensor:
-    # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
-    self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device, dtype=original_samples.dtype)
-    timesteps = timesteps.to(original_samples.device)
-
-    sqrt_alpha_prod = self.alphas_cumprod[timesteps] ** 0.5
-    sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-    while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
-      sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-
-    sqrt_one_minus_alpha_prod = (1 - self.alphas_cumprod[timesteps]) ** 0.5
-    sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-    while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
-      sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
-
-    noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
-    return noisy_samples
-
-  def __len__(self):
-    return self.config.num_train_timesteps
-# endregion
-
-
 class PipelineLike():
   r"""
   Pipeline for text-to-image generation using Stable Diffusion without tokens length limit, and support parsing
@@ -2766,16 +1356,6 @@ class PipelineLike():
       new_config["clip_sample"] = False
       scheduler._internal_dict = FrozenDict(new_config)
 
-    # if safety_checker is None:
-    #   logger.warn(
-    #       f"You have disabled the safety checker for {self.__class__} by passing `safety_checker=None`. Ensure"
-    #       " that you abide to the conditions of the Stable Diffusion license and do not expose unfiltered"
-    #       " results in services or applications open to the public. Both the diffusers team and Hugging Face"
-    #       " strongly recommend to keep the safety filter enabled in all public facing circumstances, disabling"
-    #       " it only for use-cases that involve analyzing network behavior or auditing its results. For more"
-    #       " information, please have a look at https://github.com/huggingface/diffusers/pull/254 ."
-    #   )
-
     self.vae = vae
     self.text_encoder = text_encoder
     self.tokenizer = tokenizer
@@ -2790,6 +1370,7 @@ class PipelineLike():
     self.normalize = transforms.Normalize(mean=FEATURE_EXTRACTOR_IMAGE_MEAN, std=FEATURE_EXTRACTOR_IMAGE_STD)
     self.make_cutouts = MakeCutouts(FEATURE_EXTRACTOR_SIZE)
 
+# region xformersとか使う部分：独自に書き換えるので関係なし
   def enable_xformers_memory_efficient_attention(self):
     r"""
     Enable memory efficient attention as implemented in xformers.
@@ -2849,6 +1430,7 @@ class PipelineLike():
     # for cpu_offloaded_model in [self.unet, self.text_encoder, self.vae, self.safety_checker]:
     #   if cpu_offloaded_model is not None:
     #     cpu_offload(cpu_offloaded_model, device)
+# endregion
 
   @torch.no_grad()
   def __call__(
@@ -3699,14 +2281,14 @@ def get_prompts_with_weights(pipe: PipelineLike, prompt: List[str], max_length: 
   return tokens, weights
 
 
-def pad_tokens_and_weights(tokens, weights, max_length, bos, eos, no_boseos_middle=True, chunk_length=77):
+def pad_tokens_and_weights(tokens, weights, max_length, bos, eos, pad, no_boseos_middle=True, chunk_length=77):
   r"""
   Pad the tokens (with starting and ending tokens) and weights (with 1.0) to max_length.
   """
   max_embeddings_multiples = (max_length - 2) // (chunk_length - 2)
   weights_length = max_length if no_boseos_middle else max_embeddings_multiples * chunk_length
   for i in range(len(tokens)):
-    tokens[i] = [bos] + tokens[i] + [eos] * (max_length - 1 - len(tokens[i]))
+    tokens[i] = [bos] + tokens[i] + [eos] + [pad] * (max_length - 2 - len(tokens[i]))
     if no_boseos_middle:
       weights[i] = [1.0] + weights[i] + [1.0] * (max_length - 1 - len(weights[i]))
     else:
@@ -3729,6 +2311,8 @@ def get_unweighted_text_embeddings(
     text_input: torch.Tensor,
     chunk_length: int,
     clip_skip: int,
+    eos: int,
+    pad: int,
     no_boseos_middle: Optional[bool] = True,
 ):
   """
@@ -3744,7 +2328,14 @@ def get_unweighted_text_embeddings(
 
       # cover the head and the tail by the starting and the ending tokens
       text_input_chunk[:, 0] = text_input[0, 0]
-      text_input_chunk[:, -1] = text_input[0, -1]
+      if pad == eos:                        # v1
+        text_input_chunk[:, -1] = text_input[0, -1]
+      else:                                 # v2
+        if text_input_chunk[:, -1] != eos and text_input_chunk[:, -1] != pad:     # 最後に普通の文字がある
+          text_input_chunk[:, -1] = eos
+        if text_input_chunk[:, 1] == pad:                                         # BOSだけであとはPAD
+          text_input_chunk[:, 1] = eos
+
       if clip_skip is None or clip_skip == 1:
         text_embedding = pipe.text_encoder(text_input_chunk)[0]
       else:
@@ -3848,12 +2439,14 @@ def get_weighted_text_embeddings(
   # pad the length of tokens and weights
   bos = pipe.tokenizer.bos_token_id
   eos = pipe.tokenizer.eos_token_id
+  pad = pipe.tokenizer.pad_token_id
   prompt_tokens, prompt_weights = pad_tokens_and_weights(
       prompt_tokens,
       prompt_weights,
       max_length,
       bos,
       eos,
+      pad,
       no_boseos_middle=no_boseos_middle,
       chunk_length=pipe.tokenizer.model_max_length,
   )
@@ -3865,6 +2458,7 @@ def get_weighted_text_embeddings(
         max_length,
         bos,
         eos,
+        pad,
         no_boseos_middle=no_boseos_middle,
         chunk_length=pipe.tokenizer.model_max_length,
     )
@@ -3876,6 +2470,7 @@ def get_weighted_text_embeddings(
       prompt_tokens,
       pipe.tokenizer.model_max_length,
       clip_skip,
+      eos, pad,
       no_boseos_middle=no_boseos_middle,
   )
   prompt_weights = torch.tensor(prompt_weights, dtype=text_embeddings.dtype, device=pipe.device)
@@ -3885,6 +2480,7 @@ def get_weighted_text_embeddings(
         uncond_tokens,
         pipe.tokenizer.model_max_length,
         clip_skip,
+        eos, pad,
         no_boseos_middle=no_boseos_middle,
     )
     uncond_weights = torch.tensor(uncond_weights, dtype=uncond_embeddings.dtype, device=pipe.device)
@@ -3946,13 +2542,13 @@ VAE_PREFIX = "first_stage_model."
 
 def load_vae(vae, dtype):
   print(f"load VAE: {vae}")
-  if os.path.isdir(vae):
+  if os.path.isdir(vae) or not os.path.isfile(vae):
     # Diffusers
-    # if os.path.isdir(os.path.join(vae, "vae")):
-    #   subfolder = "vae"
-    # else:
-    #   subfolder = None
-    vae = AutoencoderKL.from_pretrained(vae, torch_dtype=dtype)
+    if not os.path.isdir(vae):      # load from Hugging Face
+      subfolder = "vae"
+    else:
+      subfolder = None
+    vae = AutoencoderKL.from_pretrained(vae, subfolder=subfolder, torch_dtype=dtype)
     return vae
 
   vae_config = create_vae_diffusers_config()
@@ -3998,26 +2594,32 @@ def main(args):
   highres_fix = args.highres_fix_scale is not None
   assert not highres_fix or args.image_path is None, f"highres_fix doesn't work with img2img / highres_fixはimg2imgと同時に使えません"
 
-  assert not args.v2 or (args.sampler in['ddim','euler','k_euler']), f"only ddim/euler supported for SDv2 / SDv2ではsamplerはddimかeulerしか使えません"
+  assert not args.v2 or (args.sampler in ['ddim', 'euler', 'k_euler']
+                         ), f"only ddim/euler supported for SDv2 / SDv2ではsamplerはddimかeulerしか使えません"
+
+  if args.v_parameterization and not args.v2:
+    print("v_parameterization should be with v2 / v1でv_parameterizationを使用することは想定されていません")
+  if args.v2 and args.clip_skip is not None:
+    print("v2 with clip_skip will be unexpected / v2でclip_skipを使用することは想定されていません")
 
   # モデルを読み込む
   use_stable_diffusion_format = os.path.isfile(args.ckpt)
   if use_stable_diffusion_format:
     print("load StableDiffusion checkpoint")
-    if args.v2:
-      text_encoder, vae, unet = load_models_from_stable_diffusion_checkpoint_v2(args.ckpt, dtype)
-    else:
-      text_encoder, vae, unet = load_models_from_stable_diffusion_checkpoint(args.ckpt, dtype)
+    text_encoder, vae, unet = load_models_from_stable_diffusion_checkpoint(args.v2, args.ckpt)
   else:
     print("load Diffusers pretrained models")
-    text_encoder = CLIPTextModel.from_pretrained(args.ckpt, subfolder="text_encoder", torch_dtype=dtype)
-    vae = AutoencoderKL.from_pretrained(args.ckpt, subfolder="vae", torch_dtype=dtype)
-    unet = UNet2DConditionModel.from_pretrained(args.ckpt, subfolder="unet", torch_dtype=dtype)
+    pipe = StableDiffusionPipeline.from_pretrained(args.ckpt, safety_checker=None, torch_dtype=dtype)
+    text_encoder = pipe.text_encoder
+    vae = pipe.vae
+    unet = pipe.unet
+    tokenizer = pipe.tokenizer
+    del pipe
 
   # VAEを読み込む
   if args.vae is not None:
     vae = load_vae(args.vae, dtype)
-    print("VAE loaded")
+    print("additional VAE loaded")
 
   if args.clip_guidance_scale > 0.0 or args.clip_image_guidance_scale:
     print("prepare clip model")
@@ -4050,16 +2652,17 @@ def main(args):
 
   # tokenizerを読み込む
   print("loading tokenizer")
-  if args.v2:
-    tokenizer = text_encoder.tokenizer_wrapper
-  else:
-    tokenizer = CLIPTokenizer.from_pretrained(TOKENIZER_PATH)  # , model_max_length=max_token_length + 2)
+  if use_stable_diffusion_format:
+    if args.v2:
+      tokenizer = CLIPTokenizer.from_pretrained(V2_STABLE_DIFFUSION_PATH, subfolder="tokenizer")
+    else:
+      tokenizer = CLIPTokenizer.from_pretrained(TOKENIZER_PATH)  # , model_max_length=max_token_length + 2)
 
   # schedulerを用意する
   sched_init_args = {}
   if args.sampler == "ddim":
     scheduler_cls = DDIMScheduler
-    scheduler_module = None  # diffusers.schedulers.scheduling_ddim
+    scheduler_module = diffusers.schedulers.scheduling_ddim
   elif args.sampler == "ddpm":                    # ddpmはおかしくなるのでoptionから外してある
     scheduler_cls = DDPMScheduler
     scheduler_module = diffusers.schedulers.scheduling_ddpm
@@ -4071,16 +2674,16 @@ def main(args):
     scheduler_module = diffusers.schedulers.scheduling_lms_discrete
   elif args.sampler == 'euler' or args.sampler == 'k_euler':
     scheduler_cls = EulerDiscreteScheduler
-    scheduler_module = None # diffusers.schedulers.scheduling_euler_discrete
+    scheduler_module = diffusers.schedulers.scheduling_euler_discrete
   elif args.sampler == 'euler_a' or args.sampler == 'k_euler_a':
     scheduler_cls = EulerAncestralDiscreteScheduler
     scheduler_module = diffusers.schedulers.scheduling_euler_ancestral_discrete
   elif args.sampler == "dpmsolver" or args.sampler == "dpmsolver++":
     scheduler_cls = DPMSolverMultistepScheduler
     sched_init_args['algorithm_type'] = args.sampler
-    scheduler_module = None
+    scheduler_module = diffusers.schedulers.scheduling_dpmsolver_multistep
 
-  if args.v2:
+  if args.v_parameterization:
     sched_init_args['prediction_type'] = 'v_prediction'
 
   # samplerの乱数をあらかじめ指定するための処理
@@ -4129,9 +2732,6 @@ def main(args):
   scheduler = scheduler_cls(num_train_timesteps=SCHEDULER_TIMESTEPS,
                             beta_start=SCHEDULER_LINEAR_START, beta_end=SCHEDULER_LINEAR_END,
                             beta_schedule=SCHEDLER_SCHEDULE, **sched_init_args)
-
-  if scheduler_module is None:
-    scheduler.randn = noise_manager.randn
 
   # custom pipelineをコピったやつを生成する
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")             # "mps"を考量してない
@@ -4404,11 +3004,15 @@ def main(args):
         fln = f"im_{highres_prefix}{step_first + i + 1:06d}.png" if args.sequential_file_name else f"im_{ts_str}_{highres_prefix}{i:03d}_{seed}.png"
         image.save(os.path.join(args.outdir, fln), pnginfo=metadata)
 
-      if args.interactive and not highres_1st:
-        for prompt, image in zip(prompts, images):
-          cv2.imshow(prompt[:128], np.array(image)[:, :, ::-1])      # プロンプトが長いと死ぬ
-          cv2.waitKey()
-          cv2.destroyAllWindows()
+      if not args.no_preview and not highres_1st and args.interactive:
+        try:
+          import cv2
+          for prompt, image in zip(prompts, images):
+            cv2.imshow(prompt[:128], np.array(image)[:, :, ::-1])      # プロンプトが長いと死ぬ
+            cv2.waitKey()
+            cv2.destroyAllWindows()
+        except ImportError:
+          print("opencv-python is not installed, cannot preview / opencv-pythonがインストールされていないためプレビューできません")
 
       return images
 
@@ -4559,10 +3163,13 @@ if __name__ == '__main__':
   parser = argparse.ArgumentParser()
 
   parser.add_argument("--v2", action='store_true', help='load Stable Diffusion v2.0 model / Stable Diffusion 2.0のモデルを読み込む')
+  parser.add_argument("--v_parameterization", action='store_true',
+                      help='enable v-parameterization training / v-parameterization学習を有効にする')
   parser.add_argument("--prompt", type=str, default=None, help="prompt / プロンプト")
   parser.add_argument("--from_file", type=str, default=None,
                       help="if specified, load prompts from this file / 指定時はプロンプトをファイルから読み込む")
   parser.add_argument("--interactive", action='store_true', help='interactive mode (generates one image) / 対話モード（生成される画像は1枚になります）')
+  parser.add_argument("--no_preview", action='store_true', help='do not show generated image in interactive mode / 対話モードで画像を表示しない')
   parser.add_argument("--image_path", type=str, default=None, help="image to inpaint or to generate from / img2imgまたはinpaintを行う元画像")
   parser.add_argument("--mask_path", type=str, default=None, help="mask in inpainting / inpaint時のマスク")
   parser.add_argument("--strength", type=float, default=None, help="img2img strength / img2img時のstrength")

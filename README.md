@@ -132,3 +132,4 @@ options:
 ## Change history
 
 * 11/25 (v3.1): Initial commit. Include support for basic SD2.0
+* 11/28 (v4): v4: SD2.0 support (new U-Net/text encoder/tokenizer), simplify by DiffUsers 0.9.0, no_preview in interactive mode
