@@ -3,7 +3,7 @@
 # v2: CLIP guided Stable Diffusion, Image guided Stable Diffusion, highres. fix
 # v3: Add dpmsolver/dpmsolver++, add VAE loading, add upscale, add 'bf16', fix the issue hypernetwork_mul is not working
 # v4: SD2.0 support (new U-Net/text encoder/tokenizer), simplify by DiffUsers 0.9.0, no_preview in interactive mode
-
+# v5: fix clip_sample=True for scheduler, add VGG guidance
 
 # Copyright 2022 kohya_ss @kohya_ss
 #
@@ -27,6 +27,53 @@
 # Diffusers (model conversion, CLIP guided stable diffusion, schedulers etc.):
 # ASL 2.0 https://github.com/huggingface/diffusers/blob/main/LICENSE
 
+"""
+VGG(
+  (features): Sequential(
+    (0): Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (1): ReLU(inplace=True)
+    (2): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (3): ReLU(inplace=True)
+    (4): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (5): Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (6): ReLU(inplace=True)
+    (7): Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (8): ReLU(inplace=True)
+    (9): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (10): Conv2d(128, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (11): ReLU(inplace=True)
+    (12): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (13): ReLU(inplace=True)
+    (14): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (15): ReLU(inplace=True)
+    (16): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (17): Conv2d(256, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (18): ReLU(inplace=True)
+    (19): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (20): ReLU(inplace=True)
+    (21): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (22): ReLU(inplace=True)
+    (23): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (24): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (25): ReLU(inplace=True)
+    (26): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (27): ReLU(inplace=True)
+    (28): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (29): ReLU(inplace=True)
+    (30): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+  )
+  (avgpool): AdaptiveAvgPool2d(output_size=(7, 7))
+  (classifier): Sequential(
+    (0): Linear(in_features=25088, out_features=4096, bias=True)
+    (1): ReLU(inplace=True)
+    (2): Dropout(p=0.5, inplace=False)
+    (3): Linear(in_features=4096, out_features=4096, bias=True)
+    (4): ReLU(inplace=True)
+    (5): Dropout(p=0.5, inplace=False)
+    (6): Linear(in_features=4096, out_features=1000, bias=True)
+  )
+)
+"""
 
 from typing import List, Optional, Union
 import glob
@@ -45,6 +92,7 @@ from typing import Any, Callable, List, Optional, Union
 import diffusers
 import numpy as np
 import torch
+import torchvision
 from diffusers import (AutoencoderKL, DDPMScheduler,
                        EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler,
                        LMSDiscreteScheduler, PNDMScheduler, DDIMScheduler, EulerDiscreteScheduler,
@@ -70,8 +118,11 @@ SCHEDULER_LINEAR_END = 0.0120
 SCHEDULER_TIMESTEPS = 1000
 SCHEDLER_SCHEDULE = 'scaled_linear'
 
+# その他の設定
 LATENT_CHANNELS = 4
 DOWNSAMPLING_FACTOR = 8
+
+CLIP_ID_L14_336 = "openai/clip-vit-large-patch14-336"
 
 # CLIP guided SD関連
 CLIP_MODEL_PATH = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
@@ -79,13 +130,18 @@ FEATURE_EXTRACTOR_SIZE = (224, 224)
 FEATURE_EXTRACTOR_IMAGE_MEAN = [0.48145466, 0.4578275, 0.40821073]
 FEATURE_EXTRACTOR_IMAGE_STD = [0.26862954, 0.26130258, 0.27577711]
 
+VGG16_IMAGE_MEAN = [0.485, 0.456, 0.406]
+VGG16_IMAGE_STD = [0.229, 0.224, 0.225]
+
 # CLIP特徴量の取得時にcutoutを使うか：使う場合にはソースを書き換えてください
 NUM_CUTOUTS = 4
 USE_CUTOUTS = False
 
-# region モデル変換
+# 次のregionはtrain_db_fixedからコピーしてるので、こちらは修正せず向こうを直すこと
 
-# StableDiffusionのモデルパラメータ
+# region checkpoint変換、読み込み、書き込み ###############################
+
+# DiffUsers版StableDiffusionのモデルパラメータ
 NUM_TRAIN_TIMESTEPS = 1000
 BETA_START = 0.00085
 BETA_END = 0.0120
@@ -112,7 +168,6 @@ VAE_PARAMS_NUM_RES_BLOCKS = 2
 V2_UNET_PARAMS_ATTENTION_HEAD_DIM = [5, 10, 20, 20]
 V2_UNET_PARAMS_CONTEXT_DIM = 1024
 
-# region checkpoint変換、読み込み、書き込み ###############################
 
 # region StableDiffusion->Diffusersの変換コード
 # convert_original_stable_diffusion_to_diffusers をコピーしている（ASL 2.0）
@@ -1322,6 +1377,9 @@ class PipelineLike():
       clip_model: CLIPModel,
       clip_guidance_scale: float,
       clip_image_guidance_scale: float,
+      vgg16_model: torchvision.models.VGG,
+      vgg16_guidance_scale: float,
+      vgg16_layer_no: int,
       # safety_checker: StableDiffusionSafetyChecker,
       # feature_extractor: CLIPFeatureExtractor,
   ):
@@ -1369,6 +1427,13 @@ class PipelineLike():
     self.clip_model = clip_model
     self.normalize = transforms.Normalize(mean=FEATURE_EXTRACTOR_IMAGE_MEAN, std=FEATURE_EXTRACTOR_IMAGE_STD)
     self.make_cutouts = MakeCutouts(FEATURE_EXTRACTOR_SIZE)
+
+    # VGG16 guidance
+    self.vgg16_guidance_scale = vgg16_guidance_scale
+    if self.vgg16_guidance_scale > 0.0:
+      return_layers = {f'{vgg16_layer_no}': 'feat'}
+      self.vgg16_feat_model = torchvision.models._utils.IntermediateLayerGetter(vgg16_model.features, return_layers=return_layers)
+      self.vgg16_normalize = transforms.Normalize(mean=VGG16_IMAGE_MEAN, std=VGG16_IMAGE_STD)
 
 # region xformersとか使う部分：独自に書き換えるので関係なし
   def enable_xformers_memory_efficient_attention(self):
@@ -1602,18 +1667,25 @@ class PipelineLike():
 
       text_embeddings_clip = self.clip_model.get_text_features(clip_text_input)
       text_embeddings_clip = text_embeddings_clip / text_embeddings_clip.norm(p=2, dim=-1, keepdim=True)      # prompt複数件でもOK
-    if self.clip_image_guidance_scale > 0:
+
+    if self.clip_image_guidance_scale > 0 or self.vgg16_guidance_scale > 0 and clip_guide_images is not None:
       if isinstance(clip_guide_images, PIL.Image.Image):
         clip_guide_images = [clip_guide_images]
       clip_guide_images = [preprocess_guide_image(im) for im in clip_guide_images]
       clip_guide_images = torch.cat(clip_guide_images, dim=0)
-      clip_guide_images = self.normalize(clip_guide_images).to(self.device).to(text_embeddings.dtype)
 
-      image_embeddings_clip = self.clip_model.get_image_features(clip_guide_images)
-      image_embeddings_clip = image_embeddings_clip / image_embeddings_clip.norm(p=2, dim=-1, keepdim=True)
-
-      if len(image_embeddings_clip) == 1:
-        image_embeddings_clip = image_embeddings_clip.repeat((batch_size, 1, 1, 1))
+      if self.clip_image_guidance_scale > 0:
+        clip_guide_images = self.normalize(clip_guide_images).to(self.device).to(text_embeddings.dtype)
+        image_embeddings_clip = self.clip_model.get_image_features(clip_guide_images)
+        image_embeddings_clip = image_embeddings_clip / image_embeddings_clip.norm(p=2, dim=-1, keepdim=True)
+        if len(image_embeddings_clip) == 1:
+          image_embeddings_clip = image_embeddings_clip.repeat((batch_size, 1, 1, 1))
+      else:
+        clip_guide_images = self.vgg16_normalize(clip_guide_images).to(self.device).to(text_embeddings.dtype)
+        image_embeddings_vgg16 = self.vgg16_feat_model(clip_guide_images)['feat']
+        print(len(image_embeddings_vgg16))
+        if len(image_embeddings_vgg16) == 1:
+          image_embeddings_vgg16 = image_embeddings_vgg16.repeat((batch_size, 1, 1, 1))
 
     # set timesteps
     self.scheduler.set_timesteps(num_inference_steps)
@@ -1717,15 +1789,18 @@ class PipelineLike():
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
       # perform clip guidance
-      if self.clip_guidance_scale > 0 or self.clip_image_guidance_scale > 0:
+      if self.clip_guidance_scale > 0 or self.clip_image_guidance_scale > 0 or self.vgg16_guidance_scale > 0:
         text_embeddings_for_guidance = (text_embeddings.chunk(2)[1] if do_classifier_free_guidance else text_embeddings)
 
         if self.clip_guidance_scale > 0:
           noise_pred, latents = self.cond_fn(latents, t, i, text_embeddings_for_guidance, noise_pred,
                                              text_embeddings_clip, self.clip_guidance_scale, NUM_CUTOUTS, USE_CUTOUTS,)
-        if self.clip_image_guidance_scale > 0:
+        if self.clip_image_guidance_scale > 0 and clip_guide_images is not None:
           noise_pred, latents = self.cond_fn(latents, t, i, text_embeddings_for_guidance, noise_pred,
                                              image_embeddings_clip, self.clip_image_guidance_scale, NUM_CUTOUTS, USE_CUTOUTS,)
+        if self.vgg16_guidance_scale > 0 and clip_guide_images is not None:
+          noise_pred, latents = self.cond_fn_vgg16(latents, t, i, text_embeddings_for_guidance, noise_pred,
+                                                   image_embeddings_vgg16, self.vgg16_guidance_scale)
 
       # compute the previous noisy sample x_t -> x_t-1
       latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
@@ -2054,9 +2129,31 @@ class PipelineLike():
   # CLIP guidance StableDiffusion
   # copy from https://github.com/huggingface/diffusers/blob/main/examples/community/clip_guided_stable_diffusion.py
 
-  @torch.enable_grad()
+  # バッチを分解して1件ずつ処理する
   def cond_fn(self, latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings_clip, clip_guidance_scale,
               num_cutouts, use_cutouts=True, ):
+    if len(latents) == 1:
+      return self.cond_fn1(latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings_clip, clip_guidance_scale,
+                           num_cutouts, use_cutouts)
+
+    noise_pred = []
+    cond_latents = []
+    for i in range(len(latents)):
+      lat1 = latents[i].unsqueeze(0)
+      tem1 = text_embeddings[i].unsqueeze(0)
+      npo1 = noise_pred_original[i].unsqueeze(0)
+      gem1 = guide_embeddings_clip[i].unsqueeze(0)
+      npr1, cla1 = self.cond_fn1(lat1, timestep, index, tem1, npo1, gem1, clip_guidance_scale, num_cutouts, use_cutouts)
+      noise_pred.append(npr1)
+      cond_latents.append(cla1)
+
+    noise_pred = torch.cat(noise_pred)
+    cond_latents = torch.cat(cond_latents)
+    return noise_pred, cond_latents
+
+  @torch.enable_grad()
+  def cond_fn1(self, latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings_clip, clip_guidance_scale,
+               num_cutouts, use_cutouts=True, ):
     latents = latents.detach().requires_grad_()
 
     if isinstance(self.scheduler, LMSDiscreteScheduler):
@@ -2102,10 +2199,80 @@ class PipelineLike():
       dists = dists.view([num_cutouts, sample.shape[0], -1])
       loss = dists.sum(2).mean(0).sum() * clip_guidance_scale
     else:
+      # バッチサイズが複数だと正しく動くかわからない
       loss = spherical_dist_loss(image_embeddings_clip, guide_embeddings_clip).mean() * clip_guidance_scale
 
     grads = -torch.autograd.grad(loss, latents)[0]
 
+    if isinstance(self.scheduler, LMSDiscreteScheduler):
+      latents = latents.detach() + grads * (sigma**2)
+      noise_pred = noise_pred_original
+    else:
+      noise_pred = noise_pred_original - torch.sqrt(beta_prod_t) * grads
+    return noise_pred, latents
+
+  # バッチを分解して一件ずつ処理する
+  def cond_fn_vgg16(self, latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings, guidance_scale):
+    if len(latents) == 1:
+      return self.cond_fn_vgg16_b1(latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings, guidance_scale)
+
+    noise_pred = []
+    cond_latents = []
+    for i in range(len(latents)):
+      lat1 = latents[i].unsqueeze(0)
+      tem1 = text_embeddings[i].unsqueeze(0)
+      npo1 = noise_pred_original[i].unsqueeze(0)
+      gem1 = guide_embeddings[i].unsqueeze(0)
+      npr1, cla1 = self.cond_fn_vgg16_b1(lat1, timestep, index, tem1, npo1, gem1, guidance_scale)
+      noise_pred.append(npr1)
+      cond_latents.append(cla1)
+
+    noise_pred = torch.cat(noise_pred)
+    cond_latents = torch.cat(cond_latents)
+    return noise_pred, cond_latents
+
+  # 1件だけ処理する
+  @torch.enable_grad()
+  def cond_fn_vgg16_b1(self, latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings, guidance_scale):
+    latents = latents.detach().requires_grad_()
+
+    if isinstance(self.scheduler, LMSDiscreteScheduler):
+      sigma = self.scheduler.sigmas[index]
+      # the model input needs to be scaled to match the continuous ODE formulation in K-LMS
+      latent_model_input = latents / ((sigma**2 + 1) ** 0.5)
+    else:
+      latent_model_input = latents
+
+    # predict the noise residual
+    noise_pred = self.unet(latent_model_input, timestep, encoder_hidden_states=text_embeddings).sample
+
+    if isinstance(self.scheduler, (PNDMScheduler, DDIMScheduler)):
+      alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
+      beta_prod_t = 1 - alpha_prod_t
+      # compute predicted original sample from predicted noise also called
+      # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+      pred_original_sample = (latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+
+      fac = torch.sqrt(beta_prod_t)
+      sample = pred_original_sample * (fac) + latents * (1 - fac)
+    elif isinstance(self.scheduler, LMSDiscreteScheduler):
+      sigma = self.scheduler.sigmas[index]
+      sample = latents - sigma * noise_pred
+    else:
+      raise ValueError(f"scheduler type {type(self.scheduler)} not supported")
+
+    sample = 1 / 0.18215 * sample
+    image = self.vae.decode(sample).sample
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = transforms.Resize(FEATURE_EXTRACTOR_SIZE)(image)
+    image = self.vgg16_normalize(image).to(latents.dtype)
+
+    image_embeddings = self.vgg16_feat_model(image)['feat']
+
+    # バッチサイズが複数だと正しく動くかわからない
+    loss = ((image_embeddings - guide_embeddings) ** 2).mean() * guidance_scale       # MSE style transferでコンテンツの損失はMSEなので
+
+    grads = -torch.autograd.grad(loss, latents)[0]
     if isinstance(self.scheduler, LMSDiscreteScheduler):
       latents = latents.detach() + grads * (sigma**2)
       noise_pred = noise_pred_original
@@ -2540,26 +2707,27 @@ def preprocess_mask(mask):
 VAE_PREFIX = "first_stage_model."
 
 
-def load_vae(vae, dtype):
-  print(f"load VAE: {vae}")
-  if os.path.isdir(vae) or not os.path.isfile(vae):
-    # Diffusers
-    if not os.path.isdir(vae):      # load from Hugging Face
+def load_vae(vae_id, dtype):
+  print(f"load VAE: {vae_id}")
+  if os.path.isdir(vae_id) or not os.path.isfile(vae_id):
+    # Diffusers local/remote
+    if not os.path.isdir(vae_id):      # load from Hugging Face
       subfolder = "vae"
     else:
       subfolder = None
-    vae = AutoencoderKL.from_pretrained(vae, subfolder=subfolder, torch_dtype=dtype)
+    vae = AutoencoderKL.from_pretrained(vae_id, subfolder=subfolder, torch_dtype=dtype)
     return vae
 
+  # local
   vae_config = create_vae_diffusers_config()
 
-  if vae.endswith(".bin"):
+  if vae_id.endswith(".bin"):
     # SD 1.5 VAE on Huggingface
-    vae_sd = torch.load(vae, map_location="cpu")
+    vae_sd = torch.load(vae_id, map_location="cpu")
     converted_vae_checkpoint = vae_sd
   else:
     # StableDiffusion
-    vae_model = torch.load(vae, map_location="cpu")
+    vae_model = torch.load(vae_id, map_location="cpu")
     vae_sd = vae_model['state_dict']
 
     # vae only or full model
@@ -2581,6 +2749,12 @@ def load_vae(vae, dtype):
   vae = AutoencoderKL(**vae_config)
   vae.load_state_dict(converted_vae_checkpoint)
   return vae
+
+
+# def load_clip_l14_336(dtype):
+#   print(f"loading CLIP: {CLIP_ID_L14_336}")
+#   text_encoder = CLIPTextModel.from_pretrained(CLIP_ID_L14_336, torch_dtype=dtype)
+#   return text_encoder
 
 
 def main(args):
@@ -2621,11 +2795,22 @@ def main(args):
     vae = load_vae(args.vae, dtype)
     print("additional VAE loaded")
 
+  # # 置換するCLIPを読み込む
+  # if args.replace_clip_l14_336:
+  #   text_encoder = load_clip_l14_336(dtype)
+  #   print(f"large clip {CLIP_ID_L14_336} is loaded")
+
   if args.clip_guidance_scale > 0.0 or args.clip_image_guidance_scale:
     print("prepare clip model")
     clip_model = CLIPModel.from_pretrained(CLIP_MODEL_PATH, torch_dtype=dtype)
   else:
     clip_model = None
+
+  if args.vgg16_guidance_scale > 0.0:
+    print("prepare resnet model")
+    vgg16_model = torchvision.models.vgg16(torchvision.models.VGG16_Weights.IMAGENET1K_V1)
+  else:
+    vgg16_model = None
 
   # xformers、Hypernetwork対応
   if not args.diffusers_xformers:
@@ -2732,6 +2917,10 @@ def main(args):
   scheduler = scheduler_cls(num_train_timesteps=SCHEDULER_TIMESTEPS,
                             beta_start=SCHEDULER_LINEAR_START, beta_end=SCHEDULER_LINEAR_END,
                             beta_schedule=SCHEDLER_SCHEDULE, **sched_init_args)
+  # clip_sample=Trueにする
+  if hasattr(scheduler.config, "clip_sample") and scheduler.config.clip_sample is False:
+    print("set clip_sample to True")
+    scheduler.config.clip_sample = True
 
   # custom pipelineをコピったやつを生成する
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")             # "mps"を考量してない
@@ -2740,6 +2929,8 @@ def main(args):
   unet.to(dtype).to(device)
   if clip_model is not None:
     clip_model.to(dtype).to(device)
+  if vgg16_model is not None:
+    vgg16_model.to(dtype).to(device)
 
   if hypernetwork is not None:
     hypernetwork.to(dtype).to(device)
@@ -2755,9 +2946,12 @@ def main(args):
       clip_model.to(memory_format=torch.channels_last)
     if hypernetwork is not None:
       hypernetwork.to(memory_format=torch.channels_last)
+    if vgg16_model is not None:
+      vgg16_model.to(memory_format=torch.channels_last)
 
   pipe = PipelineLike(device, vae, text_encoder, tokenizer, unet, scheduler, args.clip_skip,
-                      clip_model, args.clip_guidance_scale, args.clip_image_guidance_scale)
+                      clip_model, args.clip_guidance_scale, args.clip_image_guidance_scale,
+                      vgg16_model, args.vgg16_guidance_scale, args.vgg16_guidance_layer)
   print("pipeline is ready.")
 
   if args.diffusers_xformers:
@@ -2850,11 +3044,14 @@ def main(args):
       print(f"resize img2img mask images to {args.W}*{args.H}")
       mask_images = resize_images(mask_images, (args.W, args.H))
 
+  prev_image = None               # for VGG16 guided
   if args.guide_image_path is not None:
-    print(f"load image for CLIP guidance: {args.guide_image_path}")
+    print(f"load image for CLIP/VGG16 guidance: {args.guide_image_path}")
     guide_images = load_images(args.guide_image_path)
-    assert len(guide_images) > 0, f"No guide image / ガイド画像がありません: {args.image_path}"
-    print(f"loaded {len(guide_images)} guide images for CLIP guidance")
+    print(f"loaded {len(guide_images)} guide images for CLIP/VGG16 guidance")
+    if len(guide_images) == 0:
+      print(f"No guide image, use previous generated image. / ガイド画像がありません。直前に生成した画像を使います: {args.image_path}")
+      guide_images = None
   else:
     guide_images = None
 
@@ -3053,50 +3250,50 @@ def main(args):
 
       for parg in prompt_args[1:]:
         try:
-          m = re.match(r'w (\d+)', parg)
+          m = re.match(r'w (\d+)', parg, re.IGNORECASE)
           if m:
             width = int(m.group(1))
             print(f"width: {width}")
             continue
 
-          m = re.match(r'h (\d+)', parg)
+          m = re.match(r'h (\d+)', parg, re.IGNORECASE)
           if m:
             height = int(m.group(1))
             print(f"height: {height}")
             continue
 
-          m = re.match(r's (\d+)', parg)
+          m = re.match(r's (\d+)', parg, re.IGNORECASE)
           if m:               # steps
             steps = max(1, min(1000, int(m.group(1))))
             print(f"steps: {steps}")
             continue
 
-          m = re.match(r'd ([\d,]+)', parg)
+          m = re.match(r'd ([\d,]+)', parg, re.IGNORECASE)
           if m:               # seed
             seeds = [int(d) for d in m.group(1).split(',')]
             print(f"seeds: {seeds}")
             continue
 
-          m = re.match(r'l ([\d\.]+)', parg)
+          m = re.match(r'l ([\d\.]+)', parg, re.IGNORECASE)
           if m:               # scale
             scale = float(m.group(1))
             print(f"scale: {scale}")
             continue
 
-          m = re.match(r't ([\d\.]+)', parg)
+          m = re.match(r't ([\d\.]+)', parg, re.IGNORECASE)
           if m:               # strength
             strength = float(m.group(1))
             print(f"strength: {strength}")
             continue
 
-          m = re.match(r'n (.+)', parg)
+          m = re.match(r'n (.+)', parg, re.IGNORECASE)
           if m:               # negative prompt
             negative_prompt = m.group(1)
             print(f"negative prompt: {negative_prompt}")
             continue
 
-          m = re.match(r'c (.+)', parg)
-          if m:               # negative prompt
+          m = re.match(r'c (.+)', parg, re.IGNORECASE)
+          if m:               # clip prompt
             clip_prompt = m.group(1)
             print(f"clip prompt: {clip_prompt}")
             continue
@@ -3136,6 +3333,12 @@ def main(args):
 
         if guide_images is not None:
           guide_image = guide_images[global_step % len(guide_images)]
+        elif args.clip_image_guidance_scale > 0 or args.vgg16_guidance_scale > 0:
+          if prev_image is None:
+            print("Generate 1st image without guide image.")
+          else:
+            print("Use previous image as guide image.")
+            guide_image = prev_image
 
         b1 = ((global_step, prompt, negative_prompt, seed, init_image, mask_image, clip_prompt, guide_image),
               (width, height, steps, scale, strength))
@@ -3145,7 +3348,7 @@ def main(args):
 
         batch_data.append(b1)
         if len(batch_data) == args.batch_size:
-          process_batch(batch_data, highres_fix)
+          prev_image = process_batch(batch_data, highres_fix)[0]
           batch_data.clear()
 
         global_step += 1
@@ -3189,6 +3392,8 @@ if __name__ == '__main__':
   parser.add_argument("--ckpt", type=str, default=None, help="path to checkpoint of model / モデルのcheckpointファイルまたはディレクトリ")
   parser.add_argument("--vae", type=str, default=None,
                       help="path to checkpoint of vae to replace / VAEを入れ替える場合、VAEのcheckpointファイルまたはディレクトリ")
+  # parser.add_argument("--replace_clip_l14_336", action='store_true',
+  #                     help="Replace CLIP (Text Encoder) to l/14@336 / CLIP(Text Encoder)をl/14@336に入れ替える")
   parser.add_argument("--seed", type=int, default=None,
                       help="seed, or seed of seeds in multiple generation / 1枚生成時のseed、または複数枚生成時の乱数seedを決めるためのseed")
   parser.add_argument("--fp16", action='store_true', help='use fp16 / fp16を指定し省メモリ化する')
@@ -3208,6 +3413,10 @@ if __name__ == '__main__':
                       help='enable CLIP guided SD, scale for guidance (DDIM, PNDM, LMS samplers only) / CLIP guided SDを有効にしてこのscaleを適用する（サンプラーはDDIM、PNDM、LMSのみ）')
   parser.add_argument("--clip_image_guidance_scale", type=float, default=0.0,
                       help='enable CLIP guided SD by image, scale for guidance / 画像によるCLIP guided SDを有効にしてこのscaleを適用する')
+  parser.add_argument("--vgg16_guidance_scale", type=float, default=0.0,
+                      help='enable VGG16 guided SD by image, scale for guidance / 画像によるVGG16 guided SDを有効にしてこのscaleを適用する')
+  parser.add_argument("--vgg16_guidance_layer", type=int, default=20,
+                      help='layer of VGG16 to calculate contents guide (1~30, 20 for conv4_2) / VGG16のcontents guideに使うレイヤー番号 (1~30、20はconv4_2)')
   parser.add_argument("--guide_image_path", type=str, default=None, help="image to CLIP guidance / CLIP guided SDでガイドに使う画像")
   parser.add_argument("--highres_fix_scale", type=float, default=None,
                       help="enable highres fix, reso scale for 1st stage / highres fixを有効にして最初の解像度をこのscaleにする")

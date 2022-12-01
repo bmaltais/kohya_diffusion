@@ -133,8 +133,13 @@ options:
 
 ## Change history
 
-* 11/25 (v3.1): Initial commit. Include support for basic SD2.0
-*11/27 (v4):
-- DiffUsers 0.9.0 is required. Upgrade as `pip install -U diffusers[torch]==0.9.0` in the virtual environment.
-- Added support for Stable Diffusion v2.0. Add the `--v2` option. If you are using `768-v-ema.ckpt` or `stable-diffusion-2` instead of `stable-diffusion-v2-base`, add `--v_parameterization` as well. Learn more about other options.
-- Added option to not display image in interactive mode --no_preview.
+* 12/1 (v5):
+  - VGG16 Guided Stable Diffusion has been added. See VGG16 Guided Stable Diffusion.
+  - Added clip_sample=True to scheduler argument.
+  - Prompt options can now be specified in either case.
+* 11/27 (v4):
+  - DiffUsers 0.9.0 is required. Upgrade as `pip install -U diffusers[torch]==0.9.0` in the virtual environment.
+  - Added support for Stable Diffusion v2.0. Add the `--v2` option. If you are using `768-v-ema.ckpt` or `stable-diffusion-2` instead of `stable-diffusion-v2-base`, add `--v_parameterization` as well. Learn more about other options.
+  - Added option to not display image in interactive mode --no_preview.
+* 11/25 (v3.1):
+  - Initial commit. Include support for basic SD2.0
