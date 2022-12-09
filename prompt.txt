@@ -1,0 +1,3 @@
+radius kawazaki artstyle an old car --W 576 
+radius kawazaki artstyle a dead soldier --images_per_prompt 4
+radius kawazaki artstyle as a marble bust

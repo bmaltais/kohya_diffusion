@@ -133,6 +133,10 @@ options:
 
 ## Change history
 
+* 12/6 (v6):
+  - The script was divided into two parts, so it is now provided as a .zip file. Please expand it. Support for SafeTensors format has been added and the script will automatically detect it based on the file extension. Install SafeTensors with `pip install safetensors`.
+  - The `--vae` option now supports loading a single VAE model in Diffusers.
+  - The issue where the mask in img2img would get stuck has been fixed.
 * 12/1 (v5):
   - VGG16 Guided Stable Diffusion has been added. See VGG16 Guided Stable Diffusion.
   - Added clip_sample=True to scheduler argument.
